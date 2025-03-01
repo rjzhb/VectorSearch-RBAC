@@ -16,14 +16,14 @@ echo "Installing nlohmann/json library..."
 sudo apt install -y nlohmann-json-dev
 
 echo "Cloning and installing ACORN..."
-# Clone the ACORN repository if not already present
+# Clone the ACORN_lib repository if not already present
 if [ ! -d "ACORN" ]; then
     git clone https://github.com/stanford-futuredata/ACORN.git
 fi
 
-cd ACORN
+cd ACORN_lib
 
-# Build and install ACORN
+# Build and install ACORN_lib
 echo "Building ACORN..."
 cmake -DFAISS_ENABLE_GPU=OFF -DFAISS_ENABLE_PYTHON=OFF -DBUILD_TESTING=ON -DBUILD_SHARED_LIBS=ON -DCMAKE_BUILD_TYPE=Release -B build
 make -C build -j faiss
