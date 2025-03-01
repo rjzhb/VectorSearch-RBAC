@@ -1,0 +1,53 @@
+import os
+import sys
+import json
+from operator import index
+
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(project_root)
+print(sys.path)
+
+from services.config import get_db_connection
+from basic_benchmark.common_function import prepare_query_dataset, run_search_experiment, drop_extra_tables, run_test, \
+    get_index_type
+
+from controller.baseline.prefilter.initialize_partitions import initialize_user_partitions, initialize_role_partitions, \
+    initialize_combination_partitions, drop_prefilter_partition_tables, create_indexes_for_all_role_tables, \
+    drop_indexes_for_all_role_tables
+
+
+
+def test_partition_prefilter_role(iterations=3, enable_index=False, index_type="ivfflat",
+                             statistics_type="sql",
+                             generator_type="tree-based", record_recall=True, warm_up=True):
+    # drop_partition_tables()
+
+    current_index_type = get_index_type("documentblocks_role_1")
+    if enable_index:
+        if current_index_type is not None and current_index_type != index_type:
+            # If the existing index type doesn't match, drop and recreate the index
+            print(f"Index type {current_index_type} does not match requested type {index_type}, recreating index.")
+            drop_indexes_for_all_role_tables()
+
+        import time
+        start_time = time.time()
+        create_indexes_for_all_role_tables(index_type)
+        time_taken = time.time() - start_time
+        print(f"initialize prefilter role partition indexing time cost: {time_taken} seconds")
+        with open("indexed_time.json", "w") as json_file:
+            json.dump(time_taken, json_file, indent=4)
+    else:
+        drop_indexes_for_all_role_tables()
+
+
+    # Generate queries
+    queries = prepare_query_dataset(regenerate=False, num_queries=1000)
+
+    run_test(queries, f"prefilter_partition_role", iterations=iterations,
+             enable_index=enable_index,
+             statistics_type=statistics_type, generator_type=generator_type, index_type=index_type,
+             record_recall=record_recall, warm_up=warm_up)
+
+
+if __name__ == '__main__':
+    test_partition_prefilter_role(enable_index=False, statistics_type="sql")

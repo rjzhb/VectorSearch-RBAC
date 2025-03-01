@@ -1,0 +1,7 @@
+{
+    "dbname": "rbacdatabase_treebase",
+    "user": "hzhong81",
+    "password": "",
+    "host": "localhost",
+    "port": "5432"
+}

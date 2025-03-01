@@ -1,0 +1,9 @@
+spacy
+psycopg2
+pandas
+psutil
+datasets
+datasketch
+scikit-learn
+matplotlib
+pyomo
