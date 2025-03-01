@@ -11,7 +11,6 @@ sys.path.append(project_root)
 print(sys.path)
 
 from basic_benchmark.condition_config import CONDITION_CONFIG
-from controller.baseline.postfilter.postfilter import search_documents_with_postfilter_alg1
 from controller.baseline.prefilter.initialize_partitions import initialize_user_partitions, initialize_role_partitions, \
     initialize_combination_partitions, drop_prefilter_partition_tables
 from services.config import get_db_connection
