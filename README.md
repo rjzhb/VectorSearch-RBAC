@@ -98,12 +98,12 @@ python3 initialize_combination_role_partition_tables.py
 python3 generate_queries.py --num_queries 1000 --topk 10 --num_threads 4
 ```
 
-### Initilize honeybee partition
+### Initilize dynamic partition
 ```sh
-# initilize HONEYBEE
+# initilize dynamic
 go to controller/dynamic_partition/hnsw
 # if needed, delete parameter_hnsw.json from hnsw directory to regenerate parameters
-python3 honeybee_dynamic_partition.py --storage 2.0 --recall 0.95
+python3 AnonySys_dynamic_partition.py --storage 2.0 --recall 0.95
 ```
 
 Run(HNSW index)
@@ -114,7 +114,7 @@ go to basic_benchmark directory
 python test_all.py --algorithm RLS --efs 20 30 40 50
 python test_all.py --algorithm ROLE --efs 20 30 40 50
 python test_all.py --algorithm USER --efs 20 30 40 50
-python test_all.py --algorithm HONEYBEE --efs 20 30 40 50
+python test_all.py --algorithm AnonySys --efs 20 30 40 50
 ```
 
 

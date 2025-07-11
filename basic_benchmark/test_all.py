@@ -20,8 +20,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run benchmark tests with partition and index strategies.")
 
     # Add arguments for test selection and EF values
-    parser.add_argument('--algorithm', choices=['RLS', 'ROLE', 'USER', 'HONEYBEE'], required=True,
-                        help="Select which test to run: RLS, ROLE, USER, or HONEYBEE")
+    parser.add_argument('--algorithm', choices=['RLS', 'ROLE', 'USER', 'AnonySys'], required=True,
+                        help="Select which test to run: RLS, ROLE, USER, or AnonySys")
     parser.add_argument('--efs', type=int, nargs='+', required=True,
                         help="List of EF search values to use (space-separated integers)")
     # Parse the arguments
@@ -81,10 +81,10 @@ if __name__ == '__main__':
                 warm_up=True
             )
 
-    elif test_type == 'HONEYBEE':
+    elif test_type == 'AnonySys':
         for ef in ef_search_values:
             efconfig.ef_search = ef
-            print(f"Running HONEYBEE test with ef_search = {ef}")
+            print(f"Running AnonySys test with ef_search = {ef}")
             test_dynamic_partition_search(iterations=1,
                                           enable_index=enable_index,
                                           statistics_type="sql",
