@@ -22,7 +22,7 @@ from controller.baseline.pg_row_security.row_level_security import (
     disable_row_level_security, drop_database_users, create_database_users, enable_row_level_security,
     get_db_connection_for_many_users
 )
-from controller.initialize_main_tables import create_indexes
+from controller.initialize_main_tables import create_indexes, drop_indexes
 from services.config import get_db_connection
 from basic_benchmark.common_function import save_query_plan, ground_truth_func, get_index_type
 from collections import OrderedDict
@@ -434,6 +434,7 @@ def get_hnsw_recall_parameters():
 
     current_idx_type = get_index_type("documentblocks")
     if current_idx_type != "hnsw":
+        drop_indexes()
         logger.info("Rebuilding vector index for HNSW (current=%s)", current_idx_type)
         create_indexes(index_type="hnsw")
     else:
