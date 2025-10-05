@@ -77,6 +77,7 @@ if __name__ == '__main__':
         from services.read_dataset_function import generate_query_dataset, generate_query_dataset_for_roles, \
             generate_query_dataset_for_cache, \
             generate_query_dataset_with_roles_and_repetitions
+        from basic_benchmark.common_function import clear_ground_truth_cache
 
         # Set up command-line argument parser with only the essential parameters
         parser = argparse.ArgumentParser(description='Generate query dataset')
@@ -87,6 +88,10 @@ if __name__ == '__main__':
         # Parse arguments
         args = parser.parse_args()
 
+        # Clear ground truth cache when regenerating queries (since queries changed)
+        print("Clearing ground truth cache (queries will be regenerated)...")
+        clear_ground_truth_cache()
+
         # Keep the other parameters as default
         generate_query_dataset(
             num_queries=args.num_queries,
@@ -95,3 +100,5 @@ if __name__ == '__main__':
             zipf_param=0,
             num_threads=args.num_threads
         )
+
+        print("✓ Query generation complete!")

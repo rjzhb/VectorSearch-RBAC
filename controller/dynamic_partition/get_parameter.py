@@ -29,6 +29,10 @@ from controller.baseline.pg_row_security.row_level_security import drop_database
 from controller.initialize_main_tables import drop_indexes, create_indexes
 from basic_benchmark.common_function import get_index_type, prepare_query_dataset, run_test
 from services.config import get_db_connection
+from services.logger import get_logger
+
+
+logger = get_logger(__name__)
 
 
 def get_alpha_beta_gamma_hashjointime(k_queries=1):
@@ -102,19 +106,81 @@ def get_alpha2(k_queries=1):
 
     return avg_alpha2
 
-def get_recall_parameters(index_type = "hnsw"):
-    generate_query_dataset(num_queries=1000, topk=5, output_file="query_dataset.json", zipf_param=0)
+def _ensure_query_dataset(generator_fn, *, output_file, num_queries, **generator_kwargs):
+    """Create the heavy query dataset only when we really need to."""
+    benchmark_folder = os.path.join(project_root, "basic_benchmark")
+    dataset_path = os.path.join(benchmark_folder, output_file)
+
+    regenerate = generator_kwargs.pop("regenerate", False)
+
+    if regenerate or not os.path.exists(dataset_path):
+        logger.info(
+            "Generating %s with %d queries (regenerate=%s)...",
+            output_file,
+            num_queries,
+            regenerate,
+        )
+        start = time.perf_counter()
+        generator_fn(
+            num_queries=num_queries,
+            output_file=dataset_path,
+            **generator_kwargs,
+        )
+        elapsed = time.perf_counter() - start
+        logger.info("Saved dataset to %s in %.2fs", dataset_path, elapsed)
+    else:
+        logger.info("Reusing cached dataset at %s", dataset_path)
+
+
+def get_recall_parameters(index_type="hnsw", *, num_queries=None, regenerate=False):
     if index_type == "hnsw":
-       return get_hnsw_recall_parameters()
+        query_count = num_queries or int(os.getenv("HNSW_RECALL_PARAM_QUERIES", "1000"))
+        logger.info(
+            "Preparing recall parameters (queries=%d, regenerate=%s)",
+            query_count,
+            regenerate,
+        )
+        _ensure_query_dataset(
+            generate_query_dataset,
+            output_file="query_dataset.json",
+            num_queries=query_count,
+            topk=5,
+            zipf_param=0,
+            num_threads=4,
+            regenerate=regenerate,
+        )
+        start = time.perf_counter()
+        params = get_hnsw_recall_parameters()
+        elapsed = time.perf_counter() - start
+        logger.info("Finished recall parameter fit in %.2f min", elapsed / 60)
+        return params
     elif index_type == "ivfflat":
         return None
 
 
 
-def get_QPS_parameters(index_type = "hnsw"):
-    generate_query_dataset_for_cache(num_queries=1000, topk=5, output_file="query_dataset.json", zipf_param=0)
+def get_QPS_parameters(index_type="hnsw", *, num_queries=None, regenerate=False):
     if index_type == "hnsw":
-       return get_hnsw_qps_parameters()
+        query_count = num_queries or int(os.getenv("HNSW_QPS_PARAM_QUERIES", "1000"))
+        logger.info(
+            "Preparing QPS parameters (queries=%d, regenerate=%s)",
+            query_count,
+            regenerate,
+        )
+        _ensure_query_dataset(
+            generate_query_dataset_for_cache,
+            output_file="query_dataset.json",
+            num_queries=query_count,
+            topk=5,
+            zipf_param=0,
+            num_threads=4,
+            regenerate=regenerate,
+        )
+        start = time.perf_counter()
+        params = get_hnsw_qps_parameters()
+        elapsed = time.perf_counter() - start
+        logger.info("Finished QPS parameter fit in %.2f min", elapsed / 60)
+        return params
     elif index_type == "ivfflat":
         return None
 
@@ -151,12 +217,12 @@ def save_parameter_to_json(index_type=None):
         params_qps, join_times = get_QPS_parameters(index_type=index_type)
         a = params_qps[0]
         b = params_qps[1]
-        print("Parameters:")
-        print(f"  k: {k}")
-        print(f"  beta: {beta}")
-        print(f"  a: {a}")
-        print(f"  b: {b}")
-        print(f" join_times: {join_times}")
+        logger.info("Parameters:")
+        logger.info("  k: %s", k)
+        logger.info("  beta: %s", beta)
+        logger.info("  a: %s", a)
+        logger.info("  b: %s", b)
+        logger.info("  join_times: %s", join_times)
         result_data = {
             "k": k,
             "beta": beta,
@@ -169,7 +235,7 @@ def save_parameter_to_json(index_type=None):
         # Write the results to the JSON file
     with open(json_file_path, "w") as json_file:
         json.dump(result_data, json_file, indent=4)
-    print(f"Data written to parameter_{index_type}.json")
+    logger.info("Data written to parameter_%s.json", index_type)
 
 
 if __name__ == '__main__':

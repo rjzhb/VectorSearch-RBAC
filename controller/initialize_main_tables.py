@@ -1,5 +1,12 @@
 import psycopg2
 from psycopg2 import sql
+import sys
+import os
+
+
+project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(project_root)
+
 from services.config import get_db_connection
 
 def initialize_database_deduplication(enable_index=False):

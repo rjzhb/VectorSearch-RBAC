@@ -121,6 +121,58 @@ def dynamic_partition_recall_analysis(user_id, query_vector, topk=5, ef_searchs=
     return results
 
 
+def dynamic_partition_recall_analysis_with_groundtruth(user_id, query_vector, topk, ef_searchs, ground_truth_set):
+    """
+    Optimized version that accepts pre-computed ground truth set to avoid redundant computation.
+    """
+    conn = get_db_connection_for_many_users(user_id)
+    cur = conn.cursor()
+    cur.execute(f"SET jit = off;")
+    results = {}
+
+    for ef_search in ef_searchs:
+        cur.execute(f"SET hnsw.ef_search = {ef_search};")
+        all_results = []
+
+        # Fetch partition IDs
+        cur.execute("""
+            SELECT partition_id FROM RolePartitions rp
+            JOIN UserRoles ur ON rp.role_id = ur.role_id
+            WHERE ur.user_id = %s;
+        """, [user_id])
+        accessible_partitions = {row[0] for row in cur.fetchall()}
+
+        # Search each partition and collect results
+        for partition_id in accessible_partitions:
+            partition_table = sql.Identifier(f"documentblocks_partition_{partition_id}")
+
+            query = sql.SQL(
+                """
+                SELECT block_id, document_id, block_content,
+                       vector <-> %s::vector AS distance
+                FROM {}
+                ORDER BY distance
+                LIMIT %s;
+                """
+            ).format(partition_table)
+
+            cur.execute(query, [query_vector, topk])
+            all_results.extend(cur.fetchall())
+
+        # Merge results and calculate recall
+        merged_results = merge_results(all_results, topk)
+        retrieved_set = set((result[1], result[0]) for result in merged_results)
+
+        # Calculate recall using pre-computed ground truth
+        correct_matches = len(retrieved_set & ground_truth_set)
+        recall = correct_matches / len(ground_truth_set) if ground_truth_set else 0
+        results[ef_search] = recall
+
+    cur.close()
+    conn.close()
+    return results
+
+
 def calculate_hnsw_recall_global(user_id, ef_search_values, topk, p, x, roles, role_to_documents, document_to_index, c,
                                  n, m,
                                  k=1,
@@ -212,13 +264,26 @@ def validate_recall_model_with_avg(query_dataset, ef_search_values, topk, p, x, 
     actual_recalls = {ef_search: [] for ef_search in ef_search_values}
     formula_recalls = []
 
+    # Batch compute all ground truths first (MUCH faster!)
+    from basic_benchmark.common_function import ground_truth_func_batch, set_ground_truth_total_queries
+    set_ground_truth_total_queries(len(query_dataset))
+    print(f"Computing ground truth for {len(query_dataset)} queries in batch mode...")
+    ground_truth_results_list = ground_truth_func_batch(query_dataset)
+    print(f"Ground truth computation complete!")
+
     # Run experiments to get actual recall values
-    for query in query_dataset:
+    for i, query in enumerate(query_dataset):
         user_id = query["user_id"]
         query_vector = query["query_vector"]
 
-        # Calculate actual recall for all ef_search values
-        query_results = dynamic_partition_recall_analysis(user_id, query_vector, topk=topk, ef_searchs=ef_search_values)
+        # Use pre-computed ground truth
+        ground_truth = ground_truth_results_list[i]
+        ground_truth_set = set((result[1], result[0]) for result in ground_truth)
+
+        # Calculate actual recall for all ef_search values (reuse ground truth)
+        query_results = dynamic_partition_recall_analysis_with_groundtruth(
+            user_id, query_vector, topk, ef_search_values, ground_truth_set
+        )
 
         for ef_search, recall in query_results.items():
             actual_recalls[ef_search].append(recall)

@@ -10,17 +10,23 @@ from psycopg2 import sql
 from scipy.optimize import curve_fit
 import os
 
+from services.logger import get_logger
+
 project_root = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 sys.path.append(project_root)
-print(project_root)
+logger = get_logger(__name__)
+logger.info("project_root set to %s", project_root)
 # Row-level security imports
 from controller.baseline.pg_row_security.row_level_security import (
     disable_row_level_security, drop_database_users, create_database_users, enable_row_level_security,
     get_db_connection_for_many_users
 )
+from controller.initialize_main_tables import create_indexes
 from services.config import get_db_connection
-from basic_benchmark.common_function import save_query_plan, ground_truth_func
+from basic_benchmark.common_function import save_query_plan, ground_truth_func, get_index_type
+from collections import OrderedDict
+import os
 from controller.clear_database import clear_tables
 
 topk = None
@@ -120,19 +126,23 @@ def search_documents_rls_for_analysis_with_execution_time(user_id, query_vector,
 
 
 # Step 2: Actual recall calculation
-def search_documents_rls_for_analysis(user_id, query_vector, topk, ef_search_values):
+def search_documents_rls_for_analysis(user_id, query_vector, topk, ef_search_values, conn=None):
     """
     Search documents with row-level security using a specified ef_search value.
     This function retrieves the topk results based on vector similarity.
     """
     results = []
-    conn = get_db_connection_for_many_users(user_id)  # Reuse the same connection for this user
+    close_conn = False
+    if conn is None:
+        conn = get_db_connection_for_many_users(user_id)
+        close_conn = True
+
     try:
         cur = conn.cursor()
         for ef_search in ef_search_values:
             cur.execute(f"SET LOCAL hnsw.ef_search = {ef_search};")
             query = """
-                SELECT block_id, document_id, block_content, vector <-> %s::vector AS distance
+                SELECT block_id, document_id, vector <-> %s::vector AS distance
                 FROM DocumentBlocks
                 ORDER BY distance
                 LIMIT %s
@@ -141,7 +151,8 @@ def search_documents_rls_for_analysis(user_id, query_vector, topk, ef_search_val
             results.append(cur.fetchall())
     finally:
         cur.close()
-        conn.close()
+        if close_conn:
+            conn.close()
     return results
 
 
@@ -297,26 +308,104 @@ def plot_average_recall_with_piecewise_fit(query_dataset, ef_search_values, grou
     start = time.time()
     recalls = {ef_search: [] for ef_search in ef_search_values}  # Initialize dictionary to store recalls
 
-    for query in query_dataset:
-        user_id = query["user_id"]
-        query_vector = query["query_vector"]
-        topk = query["topk"]
+    # Batch compute all ground truths first (MUCH faster!)
+    from basic_benchmark.common_function import ground_truth_func_batch, set_ground_truth_total_queries
+    query_count = len(query_dataset)
+    set_ground_truth_total_queries(query_count)
+    logger.info("Computing ground truth for %d queries in batch mode...", query_count)
+    gt_start = time.perf_counter()
+    ground_truth_results_list = ground_truth_func_batch(query_dataset)
+    gt_elapsed = time.perf_counter() - gt_start
+    logger.info(
+        "Ground truth computation finished in %.2f min. Now computing recalls...",
+        gt_elapsed / 60,
+    )
 
-        recalls_actual = calculate_actual_recall_batch(user_id, query_vector, topk, ground_truth_func, ef_search_values)
-        # Append recalls to the corresponding ef_search key
-        for ef_search, recall in zip(ef_search_values, recalls_actual):
-            recalls[ef_search].append(recall)
+    connection_cache = OrderedDict()
+    max_cached_connections = int(os.getenv("RECALL_CONN_CACHE_SIZE", "8"))
+
+    def get_or_create_connection(uid):
+        if uid in connection_cache:
+            connection_cache.move_to_end(uid)
+            return connection_cache[uid]
+
+        conn = get_db_connection_for_many_users(uid)
+        connection_cache[uid] = conn
+        connection_cache.move_to_end(uid)
+
+        while len(connection_cache) > max_cached_connections:
+            old_uid, old_conn = connection_cache.popitem(last=False)
+            try:
+                old_conn.close()
+            except Exception:
+                pass
+        return conn
+    try:
+        for i, query in enumerate(query_dataset):
+            user_id = query["user_id"]
+            query_vector = query["query_vector"]
+            topk = query["topk"]
+
+            # Use pre-computed ground truth
+            ground_truth_results = ground_truth_results_list[i]
+
+            # Reuse a per-user connection to avoid repeated connection setup costs
+            user_conn = get_or_create_connection(user_id)
+
+            # Perform batch search for all ef_search values
+            search_start = time.perf_counter()
+            search_results_batch = search_documents_rls_for_analysis(
+                user_id, query_vector, topk, ef_search_values, conn=user_conn
+            )
+            search_elapsed = time.perf_counter() - search_start
+            logger.info(
+                "User %s recall search took %.2fs for %d ef_search values",
+                user_id,
+                search_elapsed,
+                len(ef_search_values),
+            )
+            
+            # Convert ground truth results into a set of (document_id, block_id)
+            ground_truth_combinations = set((result[1], result[0]) for result in ground_truth_results)
+
+            # Calculate recall for each ef_search
+            for j, search_results in enumerate(search_results_batch):
+                # Convert retrieved results into a set of (document_id, block_id)
+                retrieved_combinations = set((result[1], result[0]) for result in search_results)
+
+                # Calculate recall as the ratio of correct matches to ground truth size
+                correct_matches = len(retrieved_combinations & ground_truth_combinations)
+                recall = correct_matches / len(ground_truth_combinations) if ground_truth_combinations else 0
+                recalls[ef_search_values[j]].append(recall)
+
+            if (i + 1) % 20 == 0 or (i + 1) == query_count:
+                elapsed = time.time() - start
+                avg_per_query = elapsed / (i + 1)
+                logger.info(
+                    "Processed %d/%d recall queries; elapsed %.2f min, avg %.2fs per query",
+                    i + 1,
+                    query_count,
+                    elapsed / 60,
+                    avg_per_query,
+                )
+    finally:
+        for conn in connection_cache.values():
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     average_recalls = [np.mean(recalls[ef_search]) for ef_search in ef_search_values]
 
-    print(f"spend {time.time() - start} on search")
+    search_elapsed = time.time() - start
+    logger.info("Recall search phase completed in %.2f min", search_elapsed / 60)
     # Fit piecewise function
     piecewise_params = fit_piecewise_model(ef_search_values, average_recalls)
     x_fit = np.linspace(min(ef_search_values), max(ef_search_values), 100)
     piecewise_fit = piecewise_recall_model(x_fit, *piecewise_params)
 
     # Debugging: Print intermediate values
-    print(f"Fitted Parameters: {piecewise_params}")
+    logger.info("Fitted Parameters: %s", piecewise_params)
 
     # Plot comparison
     plt.figure(figsize=(12, 6))
@@ -337,21 +426,34 @@ def plot_average_recall_with_piecewise_fit(query_dataset, ef_search_values, grou
 
 
 def get_hnsw_recall_parameters():
+    logger.info("Initializing row level security context")
     disable_row_level_security()
     drop_database_users()
     create_database_users()
     enable_row_level_security()
 
+    current_idx_type = get_index_type("documentblocks")
+    if current_idx_type != "hnsw":
+        logger.info("Rebuilding vector index for HNSW (current=%s)", current_idx_type)
+        create_indexes(index_type="hnsw")
+    else:
+        logger.info("HNSW index already present on DocumentBlocks, skipping rebuild")
+
     # Load query dataset
     benchmark_folder = os.path.join(project_root, "basic_benchmark")
     query_dataset_path = os.path.join(benchmark_folder, "query_dataset.json")
+    logger.info("Loading recall query dataset from %s", query_dataset_path)
     with open(query_dataset_path, "r") as f:
         query_dataset = json.load(f)
 
     ef_search_values = [1, 3, 5, 7, 10, 20, 30, 40, 50, 75, 100, 150, 200, 300, 400, 800, 1000]
 
     # Perform analysis
+    logger.info("Starting recall analysis pipeline")
+    start = time.perf_counter()
     params = plot_average_recall_with_piecewise_fit(query_dataset, ef_search_values, ground_truth_func)
+    elapsed = time.perf_counter() - start
+    logger.info("Recall analysis completed in %.2f min", elapsed / 60)
     return params
 
 

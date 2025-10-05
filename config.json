@@ -1,7 +1,9 @@
 {
     "dbname": "rbacdatabase_treebase",
-    "user": "xx",
-    "password": "",
+    "user": "x",
+    "password": "123",
     "host": "localhost",
-    "port": "5432"
+    "port": "5432",
+    "dataset_path": "/data",
+    "use_gpu_groundtruth": true
 }

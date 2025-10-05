@@ -18,7 +18,7 @@ sys.path.append(project_root)
 
 from services.rbac_generator.tree_based_rbac_data_generator import TreeBasedRBACDataGenerator
 from services.embedding_service import generate_embedding
-from services.config import get_db_connection
+from services.config import get_db_connection, get_dataset_path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
@@ -302,11 +302,11 @@ def process_subset(data_subset, start_index, dataset_type):
 
 def read_and_store_dataset_parallel(load_number=1000, start_row=0, num_threads=4, dataset="wikipedia-22-12"):
     # Load the dataset
+    dataset_path = get_dataset_path()
     if dataset == "wikipedia-22-12":
-        data = load_dataset("json", data_files="../dataset/wikipedia-22-12/en/*.jsonl.gz")["train"]
+        data = load_dataset("json", data_files=f"{dataset_path}/wikipedia-22-12/en/*.jsonl.gz")["train"]
     elif dataset == "arxiv":
-        dataset_folder = os.path.join(project_root, "dataset/arxiv")
-        arxiv_data_file = os.path.join(dataset_folder, "arxiv-metadata-oai-snapshot.json")
+        arxiv_data_file = os.path.join(dataset_path, "arxiv/arxiv-metadata-oai-snapshot.json")
         data = load_dataset("json", data_files=arxiv_data_file)["train"]
     else:
         raise ValueError("Unsupported dataset specified")

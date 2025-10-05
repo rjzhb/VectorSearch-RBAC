@@ -9,6 +9,11 @@ from psycopg2 import sql
 # Add the project root to sys.path
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
+
+from services.logger import get_logger
+
+logger = get_logger(__name__)
+logger.debug("sys.path=%s", sys.path)
 from controller.dynamic_partition.load_result_to_database import drop_indexes_for_all_partitions, \
     create_indexes_for_all_partitions
 from controller.baseline.pg_row_security.row_level_security import drop_database_users, create_database_users
@@ -26,7 +31,11 @@ def test_dynamic_partition_search(iterations=1, enable_index=True, index_type="i
 
     if enable_index:
         if current_index_type is not None and current_index_type != index_type:
-            print(f"Index type {current_index_type} does not match {index_type}. Recreating index.")
+            logger.info(
+                "Index type %s does not match %s. Recreating index.",
+                current_index_type,
+                index_type,
+            )
             drop_indexes_for_all_partitions()
         create_indexes_for_all_partitions(index_type)
     else:

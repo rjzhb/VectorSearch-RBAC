@@ -7,7 +7,11 @@ import psycopg2
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
-print(sys.path)
+
+from services.logger import get_logger
+
+logger = get_logger(__name__)
+logger.debug("sys.path=%s", sys.path)
 
 from services.config import get_db_connection
 from basic_benchmark.common_function import prepare_query_dataset, run_search_experiment, drop_extra_tables, run_test, \
@@ -41,7 +45,7 @@ def get_existing_combination_partition_name():
         return result[0] if result else None
 
     except psycopg2.Error as e:
-        print(f"Error retrieving combination partition names: {e}")
+        logger.error("Error retrieving combination partition names: %s", e)
         return None
     finally:
         cur.close()
@@ -55,15 +59,21 @@ def test_partition_prefilter_by_combination_role(iterations=3, enable_index=Fals
 
     if enable_index:
         if current_index_type is not None and current_index_type != index_type:
-            # If the existing index type doesn't match, drop and recreate the index
-            print(f"Index type {current_index_type} does not match requested type {index_type}, recreating index.")
+            logger.info(
+                "Index type %s does not match requested type %s, recreating index.",
+                current_index_type,
+                index_type,
+            )
             drop_indexes_for_all_combination_tables()
 
         import time
         start_time = time.time()
         create_indexes_for_all_combination_tables(index_type)
         time_taken = time.time() - start_time
-        print(f"initialize prefilter combination role partition indexing time cost: {time_taken} seconds")
+        logger.info(
+            "initialize prefilter combination role partition indexing time cost: %.2f seconds",
+            time_taken,
+        )
         with open("indexed_time.json", "w") as json_file:
             json.dump(time_taken, json_file, indent=4)
     else:

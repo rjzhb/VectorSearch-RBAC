@@ -14,6 +14,12 @@ def load_config():
 
 config = load_config()
 
+def get_dataset_path():
+    """
+    Get the dataset path from config, with fallback to default.
+    """
+    return config.get("dataset_path", "../dataset")
+
 def get_db_connection():
     return psycopg2.connect(
         dbname=config["dbname"],

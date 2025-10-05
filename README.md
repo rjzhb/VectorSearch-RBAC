@@ -18,8 +18,48 @@ sudo apt-get install postgresql postgresql-contrib postgresql-server-dev-all bui
 sudo apt install libpq-dev
 ```
 
-### Install pgvector
-Ensure Pgvector is installed
+### Install and Setup pgvector
+
+The pgvector repository is already included in this project.
+
+**Initial compilation and installation:**
+```sh
+chmod +x compile_pgvector.sh
+./compile_pgvector.sh
+```
+
+This will compile pgvector in **debug mode** (`-g -O0`) which is useful for development and debugging.
+
+**After modifying pgvector source code:**
+Simply run the compile script again:
+```sh
+./compile_pgvector.sh
+```
+
+Then restart PostgreSQL to load the updated extension:
+```sh
+sudo service postgresql restart
+```
+
+### Setup Database
+
+Start PostgreSQL service:
+```sh
+sudo service postgresql start
+```
+
+Create database user and database with pgvector extension:
+```sh
+chmod +x setup_db.sh
+./setup_db.sh
+```
+
+This script will:
+- Create user `xx` (with no password, or configure your own in the script)
+- Create database `rbacdatabase_treebase`
+- Install pgvector extension
+
+**Note**: You may need to modify `setup_db.sh` to match your desired database name, username, and password. Make sure to update `config.json` accordingly.
 
 ### Setup Python Environment
 Create a virtual environment and install dependencies:
@@ -42,7 +82,9 @@ Download the dataset to {project directory}/dataset/:
 
 - [Cohere Wikipedia 22-12 Dataset](https://huggingface.co/datasets/Cohere/wikipedia-22-12)
 ```shell
-cd rbac-bench
+mkdir dataset
+cd dataset
+sudo apt-get install git-lfs
 git lfs install
 git clone https://huggingface.co/datasets/Cohere/wikipedia-22-12
 ```
@@ -50,26 +92,50 @@ git clone https://huggingface.co/datasets/Cohere/wikipedia-22-12
 
 ### Configure database config file
 
-Edit 'config.json' in project root directory.
+Edit `config.json` in project root directory to match your database setup:
 
 ```json
 {
-    "dbname": "rbacdatabase",
-    "user": "database_user",
-    "password": "database_password", 
+    "dbname": "rbacdatabase_treebase",
+    "user": "x",
+    "password": "123",
     "host": "localhost",
-    "port": "5432"
+    "port": "5432",
+    "dataset_path": "/data",
+    "use_gpu_groundtruth": false
 }
 ```
-### Run postgresql
 
-```shell
- sudo service postgresql start
+**Configuration Options:**
+- `use_gpu_groundtruth`:
+  - `false` (recommended): Use PostgreSQL for ground truth computation. Slower but no setup required.
+  - `true`: Use FAISS GPU for ground truth computation. First run is slow (builds indexes), subsequent runs are much faster.
+
+**Note**: If you used `setup_db.sh`, the default configuration is username `xx` with no password and database `rbacdatabase_treebase`. Adjust these values as needed.
+
+### Optional: Install FAISS for GPU-accelerated Ground Truth
+
+For faster ground truth computation (especially for repeated testing), install FAISS:
+
+```sh
+# Create a conda environment with FAISS GPU support
+conda create -n faiss_env python=3.11
+conda activate faiss_env
+conda install -c pytorch faiss-gpu
+
+# Install other dependencies
+pip install -r requirements.txt
 ```
+
+Then set `"use_gpu_groundtruth": true` in `config.json`.
+
+**Performance comparison:**
+- **PostgreSQL mode**: Consistent speed, no index overhead
+- **FAISS mode**: First run builds role-level indexes (slow), subsequent runs use cached indexes (very fast)
 
 ### Prepare Data
 ```sh
-cd benchmark
+cd basic_benchmark
 # adjust load_number to controll data scalability
 python3 common_prepare_pipeline.py
 
@@ -96,6 +162,13 @@ python3 initialize_combination_role_partition_tables.py
 
 # generate queries
 python3 generate_queries.py --num_queries 1000 --topk 10 --num_threads 4
+```
+
+**Ground Truth Caching:**
+- Ground truth results are automatically cached in `basic_benchmark/ground_truth_cache.json`
+- Subsequent test runs with the same queries will load from cache (instant)
+- Cache is automatically cleared when regenerating queries with `generate_queries.py`
+- To manually clear cache: `rm basic_benchmark/ground_truth_cache.json`
 ```
 
 ### Initilize dynamic partition

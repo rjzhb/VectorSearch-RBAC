@@ -3,6 +3,7 @@ import random
 import numpy as np
 import os
 import sys
+import time
 
 from matplotlib import pyplot as plt
 from scipy.optimize import curve_fit
@@ -10,14 +11,15 @@ from scipy.optimize import curve_fit
 project_root = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 sys.path.append(project_root)
-print(project_root)
+
+from services.logger import get_logger
+
+logger = get_logger(__name__)
+logger.info("project_root set to %s", project_root)
 from controller.dynamic_partition.hnsw.analysis.analysis_hnsw_recall import search_documents_rls_for_join_time_analysis, \
     search_documents_rls_for_analysis_with_execution_time
 
 from psycopg2 import sql
-import sys
-import os
-
 from services.config import get_db_connection
 
 
@@ -41,7 +43,7 @@ def search_documents_role_partition_analysis(user_id, query_vector, topk=5, ef_s
     role_ids = cur.fetchall()
 
     if not role_ids:
-        print(f"No roles found for user_id {user_id}.")
+        logger.info("No roles found for user_id %s.", user_id)
         cur.close()
         conn.close()
         return {ef_search: (0, 0) for ef_search in ef_searchs}
@@ -158,6 +160,12 @@ def run_experiment_on_ef_search(queries, ef_search_values=[40, 80, 120, 160, 200
     Only include the third repetition's time in calculations.
     Calculate the average k value for all queries.
     """
+    logger.info(
+        "Running ef_search experiment: %d queries, values=%s",
+        len(queries),
+        ef_search_values,
+    )
+    start = time.perf_counter()
     ef_search_results = {}  # Store k values grouped by ef_search
     from controller.dynamic_partition.hnsw.validate.modelqps_vs_realqps import dynamic_partition_search_analysis
     actual_query_times = {ef_search: [] for ef_search in ef_search_values}
@@ -210,6 +218,8 @@ def run_experiment_on_ef_search(queries, ef_search_values=[40, 80, 120, 160, 200
             "avg_total_rows": avg_total_rows,
             "total_rows": total_rows_by_ef_search[ef_search]
         })
+    elapsed = time.perf_counter() - start
+    logger.info("ef_search experiment completed in %.2f min", elapsed / 60)
     return results
 
 
@@ -258,7 +268,7 @@ def fit_query_time_function_with_log(results):
     plt.savefig(plot_filename)
     plt.show()
 
-    print(f"Fitted parameters: a={params[0]:.2f}, b={params[1]:.2f}")
+    logger.info("Fitted parameters: a=%.2f, b=%.2f", params[0], params[1])
     return params
 
 def fit_ef_search_function_linear(results):
@@ -293,7 +303,7 @@ def fit_ef_search_function_linear(results):
     plt.savefig(plot_filename)
     plt.show()
 
-    print(f"Fitted parameters: a={params[0]:.2f}, b={params[1]:.2f}")
+    logger.info("Fitted parameters: a=%.2f, b=%.2f", params[0], params[1])
     return params
 
 
@@ -302,6 +312,8 @@ def run_experiment_on_join_time(queries):
     Run experiments across the entire query dataset to calculate the average join time.
     Use the third repetition's join time in calculations.
     """
+    logger.info("Running join-time experiment for %d queries", len(queries))
+    start = time.perf_counter()
     results = []  # To store results for each query's join time
 
     for query in queries:
@@ -324,6 +336,12 @@ def run_experiment_on_join_time(queries):
 
     # Calculate the average join time across all queries
     avg_join_time = np.mean(results) if results else 0
+    elapsed = time.perf_counter() - start
+    logger.info(
+        "Join-time experiment completed in %.2f min (avg=%.2f)",
+        elapsed / 60,
+        avg_join_time,
+    )
 
     return avg_join_time
 
@@ -334,20 +352,30 @@ def get_hnsw_qps_parameters():
     # Load generated queries
     benchmark_folder = os.path.join(project_root, "basic_benchmark")
     query_dataset_path = os.path.join(benchmark_folder, "query_dataset.json")
+    logger.info("Loading QPS query dataset from %s", query_dataset_path)
     with open(query_dataset_path, "r") as infile:
         queries = json.load(infile)
 
     ef_search_values = [20, 40, 80, 120, 200, 300, 400]
 
     # Run experiments
+    logger.info("Starting QPS ef_search experiment")
     results = run_experiment_on_ef_search(queries, ef_search_values)
 
     # Fit the function to the results using a linear model
     # fitted_params = fit_ef_search_function_linear(results)
+    logger.info("Fitting QPS model")
+    fit_start = time.perf_counter()
     fitted_params = fit_query_time_function_with_log(results)
+    fit_elapsed = time.perf_counter() - fit_start
+    logger.info("QPS model fit completed in %.2fs", fit_elapsed)
     join_times = run_experiment_on_join_time(queries)
     # Print fitted parameters
-    print(f"Fitted Function Parameters: a={fitted_params[0]:.2f}, b={fitted_params[1]:.2f}")
+    logger.info(
+        "Fitted Function Parameters: a=%.2f, b=%.2f",
+        fitted_params[0],
+        fitted_params[1],
+    )
     return fitted_params, join_times
 
 

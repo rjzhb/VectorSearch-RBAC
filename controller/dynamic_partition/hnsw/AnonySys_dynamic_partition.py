@@ -15,12 +15,16 @@ from controller.baseline.prefilter.initialize_partitions import create_indexes_f
 from controller.initialize_main_tables import create_indexes
 from controller.dynamic_partition.hnsw.helper import fetch_initial_data, prepare_background_data, \
     delete_faiss_files
+from services.logger import get_logger
 
 from controller.dynamic_partition.get_parameter import get_recall_parameters, get_QPS_parameters
 
 from collections import defaultdict
 
 import math
+
+
+logger = get_logger(__name__)
 
 
 def init_user_role_combination_data():
@@ -78,7 +82,7 @@ def calculate_role_weights_from_queries(user_to_roles, role_combinations):
                 weight = entry.get("query_block_selectivity", 0)
                 user_weights[user_id] = weight
     except FileNotFoundError:
-        print(f"Query file {query_file_path} not found.")
+        logger.warning("Query file %s not found.", query_file_path)
         return {}
 
     # Step 2: Aggregate weights by role combination
@@ -235,13 +239,13 @@ def parse_log_file(log_file):
                     target_partition_id = int(match.group(3))  # Convert target_partition_id to an integer
                     split_steps.append((best_delta, best_comb, target_partition_id))  # Store extracted values
 
-        print(f"[LOG] Loaded {len(split_steps)} split steps from {log_file}.")
+        logger.debug("Loaded %d split steps from %s.", len(split_steps), log_file)
         return split_steps
     except FileNotFoundError:
-        print(f"[WARNING] Log file {log_file} not found. Recomputing...")  # Handle missing log file
+        logger.warning("Log file %s not found. Recomputing...", log_file)
         return None
     except Exception as e:
-        print(f"[ERROR] Failed to parse log file {log_file}: {e}")  # Catch and display any other errors
+        logger.error("Failed to parse log file %s: %s", log_file, e)
         return None
 
 
@@ -400,7 +404,7 @@ def update_comb_role_tracker_stage2(comb, target_partition_id, comb_role_tracker
                             comb_role_trackers[affected_comb][pid] = set()
                         comb_role_trackers[affected_comb][pid].add(role)
         elif not flag:
-            print(f"Warning: No valid partition set found for comb {affected_comb}.")
+            logger.warning("No valid partition set found for comb %s.", affected_comb)
 
 
 def split_comb_roles(role_to_documents_index, alpha, topk, k, beta, a, b,
@@ -432,7 +436,7 @@ def split_comb_roles(role_to_documents_index, alpha, topk, k, beta, a, b,
                 break  # Stop when multiple combinations exist in the largest partition
 
         if len(max_partition_combinations) == 1 or len(max_partition_combinations) == 0:
-            print("Partition limit reached. No further split possible.")
+            logger.info("Partition limit reached. No further split possible.")
             break  # Exit if no further splitting can be done
 
         query_time_in_comb_before = 0
@@ -591,16 +595,20 @@ def split_comb_roles(role_to_documents_index, alpha, topk, k, beta, a, b,
 
             if not priority_queue and split_flag_count == 0:
                 combination_mode = True
-                print("switch to combination mode")
+                logger.info("Switching to combination mode")
                 continue
             elif not priority_queue:
                 break
 
             best_combined_delta, query_in_role_delta, query_in_comb_delta, best_comb, target_partition_id = heapq.heappop(
                 priority_queue)
-            print(
-                f"[LOG] Selected for splitting: best_role_delta ={query_in_role_delta:.6f} ,best_comb_delta={query_in_comb_delta:.6f}, "
-                f"best_comb={best_comb}, target_partition_id={target_partition_id}")
+            logger.info(
+                "Selected for splitting: best_role_delta=%.6f, best_comb_delta=%.6f, best_comb=%s, target_partition_id=%s",
+                query_in_role_delta,
+                query_in_comb_delta,
+                best_comb,
+                target_partition_id,
+            )
 
             # Perform the split operation
             if target_partition_id not in partition_assignment:
@@ -611,7 +619,7 @@ def split_comb_roles(role_to_documents_index, alpha, topk, k, beta, a, b,
             partition_assignment[target_partition_id].update(combination_roles_to_documents[best_comb])
 
             if combination_mode == True:
-                print("start stage2")
+                logger.debug("Start stage2 combination-mode updates")
                 update_comb_role_tracker_stage2(best_comb, target_partition_id, comb_role_trackers,
                                                 partition_assignment,
                                                 role_to_documents_index, topk, k, beta, a, b)
@@ -672,7 +680,7 @@ def calculate_single_role_weights_from_queries(user_to_roles, role_combinations)
                 weight = entry.get("query_block_selectivity", 0)  # Default weight is 0 if not present
                 user_weights[user_id] = weight
     except FileNotFoundError:
-        print(f"⚠️ Query file {query_file_path} not found.")
+        logger.warning("⚠️ Query file %s not found.", query_file_path)
         return {}
 
     # Step 2: Aggregate weights by role combination
@@ -775,7 +783,7 @@ if __name__ == '__main__':
         # If the file exists, read and return data
         with open(json_file_path, "r") as json_file:
             result_data = json.load(json_file)
-            print("Data loaded from parameter_hnsw.json")
+            logger.info("Data loaded from parameter_hnsw.json")
     else:
         # If the file does not exist, generate data and save it
         params_recall = get_recall_parameters(index_type="hnsw")
@@ -784,12 +792,12 @@ if __name__ == '__main__':
         params_qps, join_times = get_QPS_parameters(index_type="hnsw")
         a = params_qps[0]
         b = params_qps[1]
-        print("Parameters:")
-        print(f"  k: {k}")
-        print(f"  beta: {beta}")
-        print(f"  a: {a}")
-        print(f"  b: {b}")
-        print(f" join_times: {join_times}")
+        logger.info("Parameters:")
+        logger.info("  k: %s", k)
+        logger.info("  beta: %s", beta)
+        logger.info("  a: %s", a)
+        logger.info("  b: %s", b)
+        logger.info("  join_times: %s", join_times)
         result_data = {
             "k": k,
             "beta": beta,
@@ -800,7 +808,7 @@ if __name__ == '__main__':
         # Write the results to the JSON file
         with open(json_file_path, "w") as json_file:
             json.dump(result_data, json_file, indent=4)
-        print("Data written to parameter_hnsw.json")
+        logger.info("Data written to parameter_hnsw.json")
 
     default_ef_search = 5
 
@@ -824,11 +832,11 @@ if __name__ == '__main__':
     # Count the number of unique roles
     count_roles_in_partition_0 = len(roles_in_partition_0)
 
-    print(f"Number of unique roles assigned to partition_id 0: {count_roles_in_partition_0}")
+    logger.info("Number of unique roles assigned to partition_id 0: %d", count_roles_in_partition_0)
 
     # delete partition index in acorn_benchmark
     delete_faiss_files(project_root)
 
     load_result_to_database(partition_assignment, converted_comb_role_trackers, increment_update=False)
     initialize_dynamic_partition_tables_in_comb(index_type="hnsw")
-    print("done")
+    logger.info("done")

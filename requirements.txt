@@ -1,5 +1,5 @@
 spacy
-psycopg2
+psycopg2-binary
 pandas
 psutil
 datasets
@@ -7,3 +7,4 @@ datasketch
 scikit-learn
 matplotlib
 pyomo
+colorama

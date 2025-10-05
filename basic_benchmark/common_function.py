@@ -5,6 +5,7 @@ import time
 from psycopg2 import sql
 import importlib
 from typing import Callable
+import numpy as np
 
 project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(project_root)
@@ -15,6 +16,11 @@ from controller.baseline.prefilter.initialize_partitions import initialize_user_
     initialize_combination_partitions, drop_prefilter_partition_tables
 from services.config import get_db_connection
 from services.read_dataset_function import generate_query_dataset, load_queries_from_dataset
+
+# Global cache for FAISS GPU ground truth
+_faiss_user_data_cache = None
+_faiss_role_data_cache = None  # Cache by role instead of user
+_faiss_query_counter = {'total': 0, 'completed': 0}
 
 
 def get_nprobe_value(config_file="config_params.json"):
@@ -406,7 +412,266 @@ def predicate_postfilter_statistics_system(user_id, query_vector, topk=5):
     return results, time.time() - start_time
 
 
-def ground_truth_func(user_id, query_vector, topk=5):
+def _load_role_vectors_for_faiss(role_id):
+    """
+    Load all vectors and metadata for a specific role (for FAISS GPU caching).
+
+    Args:
+        role_id: Role ID to load vectors for
+
+    Returns:
+        (vectors, metadata) tuple where metadata is list of (block_id, document_id, block_content)
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    try:
+        query = f"""
+            SELECT block_id, document_id, block_content, vector
+            FROM documentblocks_role_{role_id}
+        """
+        cur.execute(query)
+        results = cur.fetchall()
+    except Exception as e:
+        cur.close()
+        conn.close()
+        return None, []
+
+    cur.close()
+    conn.close()
+
+    if not results:
+        return None, []
+
+    # Remove duplicates by (block_id, document_id)
+    unique_results = {}
+    for row in results:
+        block_id = row[0]
+        document_id = row[1]
+        key = (block_id, document_id)
+        if key not in unique_results:
+            unique_results[key] = row
+
+    results = list(unique_results.values())
+
+    # Extract vectors and metadata
+    metadata = [(row[0], row[1], row[2]) for row in results]
+
+    # Parse vector strings to numpy arrays
+    vectors = []
+    for row in results:
+        vector_str = row[3]
+        if isinstance(vector_str, str):
+            vector_str = vector_str.strip('[]')
+            vector = np.array([float(x) for x in vector_str.split(',')])
+        else:
+            vector = np.array(vector_str)
+        vectors.append(vector)
+
+    vectors = np.array(vectors, dtype=np.float32)
+    return vectors, metadata
+
+
+def _load_user_vectors_for_faiss(user_id, use_role_partition=True):
+    """
+    Load all vectors and metadata for a specific user (for FAISS GPU).
+
+    Args:
+        user_id: User ID to load vectors for
+        use_role_partition: If True, use role partition tables (faster, avoids JOIN)
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    if use_role_partition:
+        # Get user's roles
+        cur.execute("SELECT role_id FROM userroles WHERE user_id = %s", [user_id])
+        role_ids = [row[0] for row in cur.fetchall()]
+
+        if not role_ids:
+            cur.close()
+            conn.close()
+            return None, []
+
+        # Query each role partition table (no JOIN needed!)
+        all_results = []
+        for role_id in role_ids:
+            try:
+                query = f"""
+                    SELECT block_id, document_id, block_content, vector
+                    FROM documentblocks_role_{role_id}
+                """
+                cur.execute(query)
+                all_results.extend(cur.fetchall())
+            except Exception:
+                # Role partition table might not exist, fall back to full table
+                use_role_partition = False
+                break
+
+        if use_role_partition:
+            results = all_results
+        else:
+            # Fall back to JOIN approach
+            query = """
+                SELECT db.block_id, db.document_id, db.block_content, db.vector
+                FROM documentblocks db
+                JOIN PermissionAssignment pa ON db.document_id = pa.document_id
+                JOIN UserRoles ur ON pa.role_id = ur.role_id
+                WHERE ur.user_id = %s
+            """
+            cur.execute(query, [user_id])
+            results = cur.fetchall()
+    else:
+        # Original JOIN approach
+        query = """
+            SELECT db.block_id, db.document_id, db.block_content, db.vector
+            FROM documentblocks db
+            JOIN PermissionAssignment pa ON db.document_id = pa.document_id
+            JOIN UserRoles ur ON pa.role_id = ur.role_id
+            WHERE ur.user_id = %s
+        """
+        cur.execute(query, [user_id])
+        results = cur.fetchall()
+
+    cur.close()
+    conn.close()
+
+    if not results:
+        return None, []
+
+    # Remove duplicates (user might have multiple roles accessing same block)
+    # Use (block_id, document_id) as key since same block_id can have different document_ids
+    unique_results = {}
+    for row in results:
+        block_id = row[0]
+        document_id = row[1]
+        key = (block_id, document_id)
+        if key not in unique_results:
+            unique_results[key] = row
+
+    results = list(unique_results.values())
+
+    # Extract vectors and metadata
+    metadata = [(row[0], row[1], row[2]) for row in results]  # (block_id, document_id, block_content)
+
+    # Parse vector strings to numpy arrays
+    vectors = []
+    for row in results:
+        vector_str = row[3]
+        # Convert PostgreSQL vector format "[1,2,3]" to numpy array
+        if isinstance(vector_str, str):
+            vector_str = vector_str.strip('[]')
+            vector = np.array([float(x) for x in vector_str.split(',')])
+        else:
+            vector = np.array(vector_str)
+        vectors.append(vector)
+
+    vectors = np.array(vectors, dtype=np.float32)
+    return vectors, metadata
+
+
+def _ground_truth_func_faiss_gpu(user_id, query_vector, topk=5):
+    """GPU-accelerated ground truth using FAISS."""
+    try:
+        import faiss
+    except ImportError:
+        print("Warning: faiss not installed, falling back to PostgreSQL ground truth")
+        return _ground_truth_func_postgres(user_id, query_vector, topk)
+
+    global _faiss_user_data_cache, _faiss_query_counter
+
+    # Build cache if needed
+    if _faiss_user_data_cache is None:
+        _faiss_user_data_cache = {}
+
+    # Load user data if not cached
+    if user_id not in _faiss_user_data_cache:
+        vectors, metadata = _load_user_vectors_for_faiss(user_id)
+        if vectors is None:
+            return []
+
+        # Build FAISS index
+        dimension = vectors.shape[1]
+        index_flat = faiss.IndexFlatL2(dimension)
+
+        # Try GPU first, fall back to CPU if it fails
+        try:
+            res = faiss.StandardGpuResources()
+            res.setTempMemory(128 * 1024 * 1024)  # Reduce temp memory to 128MB
+            gpu_index = faiss.index_cpu_to_gpu(res, 0, index_flat)
+            gpu_index.add(vectors)
+            print(f"FAISS GPU index created for user {user_id} with {len(vectors)} vectors")
+
+            _faiss_user_data_cache[user_id] = {
+                'index': gpu_index,
+                'metadata': metadata,
+                'res': res,
+                'is_gpu': True
+            }
+        except RuntimeError as e:
+            print(f"GPU allocation failed ({e}), using CPU FAISS instead")
+            index_flat.add(vectors)
+            _faiss_user_data_cache[user_id] = {
+                'index': index_flat,
+                'metadata': metadata,
+                'is_gpu': False
+            }
+
+    cache_entry = _faiss_user_data_cache[user_id]
+    index = cache_entry['index']
+    metadata = cache_entry['metadata']
+
+    # Parse query vector
+    if isinstance(query_vector, str):
+        query_vector = query_vector.strip('[]')
+        query_vec = np.array([[float(x) for x in query_vector.split(',')]], dtype=np.float32)
+    else:
+        query_vec = np.array([query_vector], dtype=np.float32)
+
+    # Search using FAISS (GPU or CPU)
+    distances, indices = index.search(query_vec, topk)
+
+    # Format results to match PostgreSQL output
+    results = []
+    for idx, dist in zip(indices[0], distances[0]):
+        block_id, document_id, block_content = metadata[idx]
+        results.append((block_id, document_id, block_content, float(dist)))
+
+    # Log completion with progress
+    _faiss_query_counter['completed'] += 1
+    gpu_status = "GPU" if cache_entry.get('is_gpu', False) else "CPU"
+    total = _faiss_query_counter['total']
+    completed = _faiss_query_counter['completed']
+    if total > 0:
+        print(f"✓ FAISS {gpu_status} query done (user {user_id}) [{completed}/{total}]")
+    else:
+        print(f"✓ FAISS {gpu_status} query done (user {user_id})")
+
+    return results
+
+
+def _format_ground_truth_results(rows):
+    """Normalize ground-truth rows so FAISS/Postgres paths return identical shapes."""
+    formatted = []
+    for row in rows:
+        if row is None or len(row) < 4:
+            continue
+        block_id = row[0]
+        document_id = row[1]
+        block_content = row[2]
+        distance = row[3]
+        try:
+            distance = float(distance)
+        except (TypeError, ValueError):
+            pass
+        formatted.append((block_id, document_id, block_content, distance))
+    return formatted
+
+
+def _ground_truth_func_postgres(user_id, query_vector, topk=5, use_role_partition=True):
+    """PostgreSQL-based ground truth (brute force), optionally using role partitions."""
+    global _faiss_query_counter
+
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -417,20 +682,62 @@ def ground_truth_func(user_id, query_vector, topk=5):
     # Convert query vector to string for the SQL query
     vector_str = query_vector
 
-    # SQL query to perform vector search with conditional filtering
-    query = """
-        SELECT db.block_id, db.document_id, db.block_content, db.vector <-> %s AS distance
-        FROM documentblocks db
-        JOIN PermissionAssignment pa ON db.document_id = pa.document_id
-        JOIN UserRoles ur ON pa.role_id = ur.role_id
-        WHERE ur.user_id = %s
-        ORDER BY distance
-        LIMIT %s
-    """
+    if use_role_partition:
+        # Get user's roles
+        cur.execute("SELECT role_id FROM userroles WHERE user_id = %s", [user_id])
+        role_ids = [row[0] for row in cur.fetchall()]
 
-    cur.execute(query, [vector_str, user_id, topk])
+        if not role_ids:
+            cur.close()
+            conn.close()
+            return []
 
-    results = cur.fetchall()
+        # Query each role partition table and collect results
+        all_results = []
+        for role_id in role_ids:
+            try:
+                query = f"""
+                    SELECT block_id, document_id, block_content, vector <-> %s::vector AS distance
+                    FROM documentblocks_role_{role_id}
+                    ORDER BY distance
+                """
+                cur.execute(query, [vector_str])
+                all_results.extend(cur.fetchall())
+            except Exception:
+                # Role partition doesn't exist, fall back to JOIN
+                use_role_partition = False
+                break
+
+        if use_role_partition:
+            # Sort all results by distance and take top-k
+            all_results.sort(key=lambda x: x[3])  # Sort by distance
+            results = _format_ground_truth_results(all_results[:topk])
+        else:
+            # Fall back to JOIN approach
+            query = """
+                SELECT db.block_id, db.document_id, db.block_content, db.vector <-> %s AS distance
+                FROM documentblocks db
+                JOIN PermissionAssignment pa ON db.document_id = pa.document_id
+                JOIN UserRoles ur ON pa.role_id = ur.role_id
+                WHERE ur.user_id = %s
+                ORDER BY distance
+                LIMIT %s
+            """
+            cur.execute(query, [vector_str, user_id, topk])
+            results = _format_ground_truth_results(cur.fetchall())
+    else:
+        # Original JOIN approach
+        query = """
+            SELECT db.block_id, db.document_id, db.block_content, db.vector <-> %s AS distance
+            FROM documentblocks db
+            JOIN PermissionAssignment pa ON db.document_id = pa.document_id
+            JOIN UserRoles ur ON pa.role_id = ur.role_id
+            WHERE ur.user_id = %s
+            ORDER BY distance
+            LIMIT %s
+        """
+        cur.execute(query, [vector_str, user_id, topk])
+        results = _format_ground_truth_results(cur.fetchall())
 
     cur.execute("RESET enable_indexscan;")
     cur.execute("RESET enable_bitmapscan;")
@@ -439,7 +746,395 @@ def ground_truth_func(user_id, query_vector, topk=5):
     cur.close()
     conn.close()
 
+    # Log completion with progress
+    _faiss_query_counter['completed'] += 1
+    total = _faiss_query_counter['total']
+    completed = _faiss_query_counter['completed']
+    partition_info = "partition" if use_role_partition else "JOIN"
+    if total > 0:
+        print(f"✓ PostgreSQL query done ({partition_info}, user {user_id}) [{completed}/{total}]")
+    else:
+        print(f"✓ PostgreSQL query done ({partition_info}, user {user_id})")
+
     return results
+
+
+def ground_truth_func(user_id, query_vector, topk=5):
+    """
+    Ground truth function with optional GPU acceleration.
+
+    Checks config.json for 'use_gpu_groundtruth' flag.
+    If True and FAISS is available, uses GPU acceleration.
+    Otherwise falls back to PostgreSQL brute force.
+    """
+    # Read config
+    config_path = os.path.join(project_root, "config.json")
+    use_gpu = False
+
+    if os.path.exists(config_path):
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+            use_gpu = config.get('use_gpu_groundtruth', False)
+
+    if use_gpu:
+        return _ground_truth_func_faiss_gpu(user_id, query_vector, topk)
+    else:
+        return _ground_truth_func_postgres(user_id, query_vector, topk)
+
+
+def clear_faiss_cache():
+    """Clear FAISS GPU cache to free memory."""
+    global _faiss_user_data_cache, _faiss_role_data_cache
+    _faiss_user_data_cache = None
+    _faiss_role_data_cache = None
+    print("FAISS cache cleared")
+
+
+def clear_ground_truth_cache():
+    """Clear ground truth cache file."""
+    cache_file = os.path.join(project_root, "basic_benchmark", "ground_truth_cache.json")
+    if os.path.exists(cache_file):
+        os.remove(cache_file)
+        print("Ground truth cache cleared")
+    else:
+        print("No ground truth cache to clear")
+
+
+def _to_json_serializable(obj):
+    """Recursively convert objects (e.g. memoryview, numpy) into JSON-safe types."""
+    if isinstance(obj, dict):
+        return {key: _to_json_serializable(value) for key, value in obj.items()}
+    if isinstance(obj, list):
+        return [_to_json_serializable(value) for value in obj]
+    if isinstance(obj, tuple):
+        return [_to_json_serializable(value) for value in obj]
+    if isinstance(obj, memoryview):
+        data = obj.tobytes()
+        try:
+            return data.decode('utf-8')
+        except UnicodeDecodeError:
+            return list(data)
+    if isinstance(obj, bytes):
+        try:
+            return obj.decode('utf-8')
+        except UnicodeDecodeError:
+            return list(obj)
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    if isinstance(obj, (np.floating, np.float32, np.float64)):
+        return float(obj)
+    if isinstance(obj, (np.integer, np.int32, np.int64)):
+        return int(obj)
+    return obj
+
+
+def _save_ground_truth_cache(queries, results, cache_file):
+    """Save ground truth results to cache file."""
+    try:
+        cache_data = []
+        for i, query in enumerate(queries):
+            cache_data.append({
+                'query': _to_json_serializable({
+                    'user_id': query['user_id'],
+                    'query_vector': query['query_vector'],
+                    'topk': query.get('topk', 5)
+                }),
+                'ground_truth': _to_json_serializable(results[i])
+            })
+
+        with open(cache_file, 'w') as f:
+            json.dump(cache_data, f)
+        print(f"✓ Ground truth cached to {cache_file}")
+    except Exception as e:
+        print(f"Warning: Failed to save ground truth cache: {e}")
+
+
+def set_ground_truth_total_queries(total):
+    """Set total number of queries for progress tracking."""
+    global _faiss_query_counter
+    _faiss_query_counter['total'] = total
+    _faiss_query_counter['completed'] = 0
+
+
+def ground_truth_func_batch(queries, use_faiss=None, use_cache=True):
+    """
+    Batch ground truth computation for multiple queries (much faster).
+
+    Args:
+        queries: List of query dicts with 'user_id', 'query_vector', 'topk'
+        use_faiss: If True, use FAISS GPU batch search. If None, read from config.json
+        use_cache: If True, cache ground truth results to disk
+
+    Returns:
+        List of results corresponding to each query
+    """
+    # Check cache first
+    cache_file = os.path.join(project_root, "basic_benchmark", "ground_truth_cache.json")
+
+    if use_cache and os.path.exists(cache_file):
+        print("Loading ground truth from cache...")
+        try:
+            with open(cache_file, 'r') as f:
+                cached_data = json.load(f)
+
+            # Verify cache matches current queries
+            if len(cached_data) == len(queries):
+                # Quick check: compare first and last query
+                def query_matches(q1, q2):
+                    return (q1['user_id'] == q2['user_id'] and
+                            q1.get('topk', 5) == q2.get('topk', 5) and
+                            q1['query_vector'] == q2['query_vector'])
+
+                if query_matches(queries[0], cached_data[0]['query']) and \
+                   query_matches(queries[-1], cached_data[-1]['query']):
+                    print(f"✓ Ground truth cache valid! Loaded {len(cached_data)} results")
+                    # Extract just the results
+                    return [item['ground_truth'] for item in cached_data]
+                else:
+                    print("Cache exists but queries don't match, recomputing...")
+            else:
+                print(f"Cache exists but size mismatch ({len(cached_data)} vs {len(queries)}), recomputing...")
+        except Exception as e:
+            print(f"Error loading cache: {e}, recomputing...")
+
+    # Read config if not specified
+    if use_faiss is None:
+        config_path = os.path.join(project_root, "config.json")
+        use_faiss = False
+        if os.path.exists(config_path):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                use_faiss = config.get('use_gpu_groundtruth', False)
+
+    if not use_faiss:
+        # Fall back to single query processing using PostgreSQL
+        results = [ground_truth_func(q['user_id'], q['query_vector'], q.get('topk', 5)) for q in queries]
+        if use_cache:
+            _save_ground_truth_cache(queries, results, cache_file)
+        return results
+    else:
+        # Use FAISS for ground truth
+        try:
+            import faiss
+        except ImportError:
+            print("Warning: faiss not installed, falling back to single query processing")
+            results = [ground_truth_func(q['user_id'], q['query_vector'], q.get('topk', 5)) for q in queries]
+            # Save cache and return
+            if use_cache:
+                _save_ground_truth_cache(queries, results, cache_file)
+            return results
+
+        global _faiss_user_data_cache, _faiss_role_data_cache, _faiss_query_counter
+
+        # Group queries by user_id for batch processing
+        from collections import defaultdict
+        queries_by_user = defaultdict(list)
+        for i, query in enumerate(queries):
+            user_id = query['user_id']
+            queries_by_user[user_id].append((i, query))
+
+        # Initialize results array
+        all_results = [None] * len(queries)
+
+        # Build cache if needed
+        if _faiss_role_data_cache is None:
+            _faiss_role_data_cache = {}
+
+    print(f"Batch processing {len(queries)} queries for {len(queries_by_user)} users...")
+
+    # Step 1: Pre-load all role indexes (much faster - shared across users!)
+    conn = get_db_connection()
+    cur = conn.cursor()
+
+    # Get all unique roles for all users
+    all_role_ids = set()
+    for user_id in queries_by_user.keys():
+        cur.execute("SELECT role_id FROM userroles WHERE user_id = %s", [user_id])
+        role_ids = [row[0] for row in cur.fetchall()]
+        all_role_ids.update(role_ids)
+
+    cur.close()
+    conn.close()
+
+    roles_to_load = [rid for rid in all_role_ids if rid not in _faiss_role_data_cache]
+    if roles_to_load:
+        print(f"Pre-loading {len(roles_to_load)} role indexes in parallel (will be shared across users)...")
+
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+        import threading
+
+        cache_lock = threading.Lock()
+        loaded_count = [0]
+
+        def load_role_index(role_id):
+            vectors, metadata = _load_role_vectors_for_faiss(role_id)
+            if vectors is None:
+                return role_id, None
+
+            # Build FAISS index for this role
+            dimension = vectors.shape[1]
+            index_flat = faiss.IndexFlatL2(dimension)
+
+            # Note: GPU transfer is not thread-safe, so we'll do CPU index in parallel
+            # and only transfer to GPU in the main thread if needed
+            index_flat.add(vectors)
+
+            result = {
+                'index': index_flat,
+                'metadata': metadata,
+                'vectors': vectors,  # Keep vectors for potential GPU transfer
+                'is_gpu': False
+            }
+
+            with cache_lock:
+                loaded_count[0] += 1
+                if loaded_count[0] % 10 == 0 or loaded_count[0] == len(roles_to_load):
+                    print(f"  [{loaded_count[0]}/{len(roles_to_load)}] Loaded role {role_id} ({len(vectors)} vectors)")
+
+            return role_id, result
+
+        # Load all role data in parallel (CPU only)
+        MAX_WORKERS = 8
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+            futures = {executor.submit(load_role_index, rid): rid for rid in roles_to_load}
+
+            for future in as_completed(futures):
+                role_id, result = future.result()
+                if result is not None:
+                    _faiss_role_data_cache[role_id] = result
+
+        print(f"✓ All {len(roles_to_load)} role indexes loaded! Now transferring to GPU...")
+
+        # Now transfer to GPU sequentially (GPU operations are not thread-safe)
+        gpu_count = 0
+        for role_id in roles_to_load:
+            if role_id not in _faiss_role_data_cache:
+                continue
+
+            cache_entry = _faiss_role_data_cache[role_id]
+            if cache_entry['is_gpu']:
+                continue
+
+            try:
+                vectors = cache_entry['vectors']
+                dimension = vectors.shape[1]
+
+                res = faiss.StandardGpuResources()
+                res.setTempMemory(128 * 1024 * 1024)
+                index_flat = faiss.IndexFlatL2(dimension)
+                gpu_index = faiss.index_cpu_to_gpu(res, 0, index_flat)
+                gpu_index.add(vectors)
+
+                # Update cache with GPU index
+                _faiss_role_data_cache[role_id] = {
+                    'index': gpu_index,
+                    'metadata': cache_entry['metadata'],
+                    'res': res,
+                    'is_gpu': True
+                }
+                gpu_count += 1
+
+                if gpu_count % 20 == 0:
+                    print(f"  GPU transfer: {gpu_count}/{len(roles_to_load)}")
+            except RuntimeError as e:
+                # Keep CPU version
+                del cache_entry['vectors']  # Free memory
+                pass
+
+        print(f"✓ GPU transfer complete: {gpu_count} on GPU, {len(roles_to_load) - gpu_count} on CPU")
+
+    # Process users in batches to show better progress
+    total_users = len(queries_by_user)
+    processed_users = 0
+    USER_BATCH_SIZE = 20  # Report progress every 20 users (more frequent updates)
+
+    # Process each user's queries in batch
+    for user_id, user_queries in queries_by_user.items():
+        # Get user's roles
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("SELECT role_id FROM userroles WHERE user_id = %s", [user_id])
+        user_role_ids = [row[0] for row in cur.fetchall()]
+        cur.close()
+        conn.close()
+
+        if not user_role_ids:
+            for idx, query in user_queries:
+                all_results[idx] = []
+            continue
+
+        # Prepare batch query vectors
+        query_vectors = []
+        topks = []
+        for idx, query in user_queries:
+            query_vector = query['query_vector']
+            topk = query.get('topk', 5)
+
+            # Parse query vector
+            if isinstance(query_vector, str):
+                query_vector = query_vector.strip('[]')
+                query_vec = np.array([float(x) for x in query_vector.split(',')], dtype=np.float32)
+            else:
+                query_vec = np.array(query_vector, dtype=np.float32)
+
+            query_vectors.append(query_vec)
+            topks.append(topk)
+
+        query_matrix = np.array(query_vectors, dtype=np.float32)
+
+        # Search each role's index and merge results
+        for i, (idx, query) in enumerate(user_queries):
+            topk = topks[i]
+            query_vec = query_matrix[i:i+1]  # Single query vector
+
+            # Collect results from all roles
+            all_role_results = []
+            for role_id in user_role_ids:
+                if role_id not in _faiss_role_data_cache:
+                    continue
+
+                role_cache = _faiss_role_data_cache[role_id]
+                role_index = role_cache['index']
+                role_metadata = role_cache['metadata']
+
+                # Search this role's index (get more than topk to account for duplicates)
+                distances, indices_result = role_index.search(query_vec, min(len(role_metadata), topk * 3))
+
+                # Format results
+                for j in range(len(indices_result[0])):
+                    result_idx = indices_result[0][j]
+                    if result_idx < 0 or result_idx >= len(role_metadata):
+                        continue
+                    dist = distances[0][j]
+                    block_id, document_id, block_content = role_metadata[result_idx]
+                    all_role_results.append((block_id, document_id, block_content, float(dist)))
+
+            # Remove duplicates and sort by distance
+            unique_results = {}
+            for result in all_role_results:
+                block_id, doc_id, content, dist = result
+                key = (block_id, doc_id)
+                if key not in unique_results or dist < unique_results[key][3]:
+                    unique_results[key] = result
+
+            # Sort by distance and take topk
+            sorted_results = sorted(unique_results.values(), key=lambda x: x[3])[:topk]
+            all_results[idx] = sorted_results
+
+        # Update progress
+        _faiss_query_counter['completed'] += len(user_queries)
+        processed_users += 1
+
+        # Only print every USER_BATCH_SIZE users or at the end
+        if processed_users % USER_BATCH_SIZE == 0 or processed_users == total_users:
+            total = _faiss_query_counter['total']
+            completed = _faiss_query_counter['completed']
+            avg_queries_per_user = completed / processed_users
+            print(f"✓ FAISS role-cache batch: [{processed_users}/{total_users}] users, [{completed}/{total}] queries, avg {avg_queries_per_user:.1f} q/user, {len(_faiss_role_data_cache)} roles cached")
+
+    if use_cache:
+        _save_ground_truth_cache(queries, all_results, cache_file)
+    return all_results
 
 
 def prepare_query_dataset(regenerate=True, num_queries=1000):
@@ -646,20 +1341,26 @@ def run_search_experiment(queries, search_func, queries_num=None, statistics_typ
     processed_queries = 0
 
     actual_queries = queries_num if queries_num else len(queries)
+    queries_to_process = queries[:actual_queries]
+
+    # Batch compute all ground truths first (much faster)
+    ground_truth_results_map = {}
+    if record_recall:
+        set_ground_truth_total_queries(len(queries_to_process))
+        print(f"Computing ground truth for {len(queries_to_process)} queries in batch mode...")
+        ground_truth_results_list = ground_truth_func_batch(queries_to_process)
+        ground_truth_results_map = {i: gt for i, gt in enumerate(ground_truth_results_list)}
+        print(f"Ground truth computation complete!")
 
     recalls = []
-    for query in queries[:actual_queries]:
+    for i, query in enumerate(queries_to_process):
         user_id = query["user_id"]
         query_vector = query["query_vector"]
         topk = query.get("topk", 5)
 
         query_total_recall = 0
         query_total_time = 0
-        ground_truth_results = None
-
-        # Get ground truth
-        if record_recall:
-            ground_truth_results = ground_truth_func(user_id=user_id, query_vector=query_vector, topk=topk)
+        ground_truth_results = ground_truth_results_map.get(i, None) if record_recall else None
         for _ in range(iterations):
             # Run search function
             if warm_up:
