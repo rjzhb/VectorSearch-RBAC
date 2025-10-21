@@ -10,9 +10,16 @@ logger = get_logger(__name__)
 logger.debug("sys.path=%s", sys.path)
 from basic_benchmark.test_partition_prefilter_by_combination_role import test_partition_prefilter_by_combination_role
 from basic_benchmark.test_partition_prefilter_by_role import test_partition_prefilter_role
+from basic_benchmark.space_calculate import (
+    calculate_prefilter,
+    calculate_rls,
+    calculate_dynamic_partition,
+    calculate_qd_tree_storage,
+)
 
 from basic_benchmark.test_dynamic_partition import test_dynamic_partition_search
 from basic_benchmark.test_row_level_security import test_row_level_security
+from basic_benchmark.test_qd_tree_partition import test_qd_tree_partition_search
 import efconfig
 
 
@@ -24,12 +31,11 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Run benchmark tests with partition and index strategies.")
 
     # Add arguments for test selection and EF values
-    parser.add_argument('--algorithm', choices=['RLS', 'ROLE', 'USER', 'AnonySys'], required=True,
-                        help="Select which test to run: RLS, ROLE, USER, or AnonySys")
+    parser.add_argument('--algorithm', choices=['RLS', 'ROLE', 'USER', 'AnonySys', 'QDTree'], required=True,
+                        help="Select which test to run: RLS, ROLE, USER, AnonySys, or QDTree")
     parser.add_argument('--efs', type=int, nargs='+', required=True,
                         help="List of EF search values to use (space-separated integers)")
-    parser.add_argument('--shared-vector-table', choices=['on', 'off'], dest='shared_vector_table',
-                        help="Override hnsw.shared_vector_table for this run")
+
     # Parse the arguments
     args = parser.parse_args()
     # Set fixed values
@@ -47,17 +53,6 @@ if __name__ == '__main__':
     logger.info("Index Type: %s", index_type)
     logger.info("Enable Index: %s", enable_index)
 
-    if args.shared_vector_table:
-        pgoptions = os.environ.get("PGOPTIONS", "").strip()
-        override = f"-c hnsw.shared_vector_table={args.shared_vector_table}"
-        if pgoptions:
-            if override not in pgoptions:
-                pgoptions = f"{pgoptions} {override}"
-        else:
-            pgoptions = override
-        os.environ["PGOPTIONS"] = pgoptions
-        logger.info("Applied PGOPTIONS override: %s", os.environ["PGOPTIONS"])
-
     if test_type == 'RLS':
         for ef in ef_search_values:
             efconfig.ef_search = ef
@@ -68,6 +63,8 @@ if __name__ == '__main__':
                                     index_type=index_type,
                                     generator_type=generator_type,
                                     warm_up=True)
+            rls_space_mb = calculate_rls("row_level_security", enable_index=enable_index)
+            logger.info("RLS storage footprint: %.2f MB", rls_space_mb)
 
     elif test_type == 'ROLE':
         for ef in ef_search_values:
@@ -82,6 +79,8 @@ if __name__ == '__main__':
                 record_recall=True,
                 warm_up=True
             )
+            role_space_mb = calculate_prefilter("prefilter_partition_role", enable_index=enable_index)
+            logger.info("Role partition storage footprint: %.2f MB", role_space_mb)
 
     elif test_type == 'USER':
         for ef in ef_search_values:
@@ -96,6 +95,8 @@ if __name__ == '__main__':
                 record_recall=True,
                 warm_up=True
             )
+            comb_space_mb = calculate_prefilter("prefilter_partition_combination", enable_index=enable_index)
+            logger.info("Combination partition storage footprint: %.2f MB", comb_space_mb)
 
     elif test_type == 'AnonySys':
         for ef in ef_search_values:
@@ -108,3 +109,20 @@ if __name__ == '__main__':
                                           generator_type=generator_type,
                                           record_recall=True,
                                           warm_up=True)
+            dynamic_space_mb = calculate_dynamic_partition("dynamic_partition", enable_index=enable_index)
+            logger.info("Dynamic partition storage footprint: %.2f MB", dynamic_space_mb)
+    elif test_type == 'QDTree':
+        for ef in ef_search_values:
+            efconfig.ef_search = ef
+            logger.info("Running QDTree test with ef_search=%s", ef)
+            test_qd_tree_partition_search(
+                iterations=1,
+                enable_index=enable_index,
+                statistics_type="sql",
+                index_type=index_type,
+                generator_type=generator_type,
+                record_recall=True,
+                warm_up=True,
+            )
+            qdt_space_mb = calculate_qd_tree_storage("qd_tree_partition", enable_index=enable_index)
+            logger.info("QDTree partition storage footprint: %.2f MB", qdt_space_mb)

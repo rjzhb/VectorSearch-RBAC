@@ -2,6 +2,7 @@ import json
 import os
 
 import sys
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 sys.path.append(project_root)
@@ -13,8 +14,17 @@ sys.path.append(project_root)
 from services.config import get_db_connection
 from controller.baseline.prefilter.initialize_partitions import create_indexes_for_all_role_tables
 from controller.initialize_main_tables import create_indexes
-from controller.dynamic_partition.hnsw.helper import fetch_initial_data, prepare_background_data, \
-    delete_faiss_files
+from controller.dynamic_partition.hnsw.helper import (
+    fetch_initial_data,
+    prepare_background_data,
+    delete_faiss_files,
+    clean_empty_partitions,
+    reorganize_partitions,
+)
+from controller.dynamic_partition.hnsw.heavy_partition_refine import (
+    rebalance_heavy_partition,
+    remap_comb_role_trackers,
+)
 from services.logger import get_logger
 
 from controller.dynamic_partition.get_parameter import get_recall_parameters, get_QPS_parameters
@@ -25,8 +35,6 @@ import math
 
 
 logger = get_logger(__name__)
-
-
 def init_user_role_combination_data():
     """
     Retrieve unique role combinations and calculate their weights (percentage of users).
@@ -721,6 +729,17 @@ if __name__ == '__main__':
                         help="Storage parameter (alpha). Higher values increase storage. Default is 1.5")
     parser.add_argument('--recall', type=float, default=None,
                         help="Recall parameter. Default is None (will use parameters from file)")
+    parser.add_argument(
+        '--enable-heavy-refinement',
+        action='store_true',
+        help='Target a severely imbalanced partition',
+    )
+    parser.add_argument(
+        '--heavy-refinement-factor',
+        type=float,
+        default=2.0,
+        help='Imbalance ratio threshold (largest vs second-largest partition) that triggers heavy refinement.',
+    )
 
     # Parse arguments
     args = parser.parse_args()
@@ -734,6 +753,11 @@ if __name__ == '__main__':
         # Sort and convert to set
         for role, docs in role_to_documents.items()
     }
+
+    document_index_to_roles: Dict[int, Set[int]] = defaultdict(set)
+    for role, doc_indices in role_to_documents_index.items():
+        for idx in doc_indices:
+            document_index_to_roles[idx].add(role)
 
     role_combinations, comb_role_weights = init_user_role_combination_data()
 
@@ -770,9 +794,10 @@ if __name__ == '__main__':
     alpha = args.storage
     recall = args.recall
     topk = 10
+    
+    # Define the JSON file path (fixed location in controller/dynamic_partition/hnsw/)
+    json_file_path = os.path.join(project_root, "controller", "dynamic_partition", "hnsw", "parameter_hnsw.json")
 
-    # Define the JSON file path
-    json_file_path = "parameter_hnsw.json"
 
     result_data = {}
 
@@ -818,25 +843,88 @@ if __name__ == '__main__':
                                                                 comb_role_weights, single_role_weights,
                                                                 combination_mode=False, recall = recall)
 
+    if args.enable_heavy_refinement:
+        logger.info(
+            "Starting rebalanced partition (partitions before rebalancing: %s)",
+            len(partition_assignment),
+        )
+        sorted_partitions = sorted(
+            ((pid, len(docs)) for pid, docs in partition_assignment.items()),
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        largest_partition_id = sorted_partitions[0][0] if sorted_partitions else None
+        largest_size = sorted_partitions[0][1] if sorted_partitions else 0
+        second_size = sorted_partitions[1][1] if len(sorted_partitions) > 1 else 0
+        if largest_partition_id is not None and largest_size > 0:
+            ratio = float('inf') if second_size == 0 else largest_size / max(second_size, 1)
+            logger.info(
+                "Applying targeted refinement to partition %s (size=%s, second=%s, ratio=%.2f, "
+                "factor threshold=%s)",
+                largest_partition_id,
+                largest_size,
+                second_size,
+                ratio,
+                args.heavy_refinement_factor,
+            )
+            if second_size > 0 and largest_size < args.heavy_refinement_factor * second_size:
+                logger.info(
+                    "Largest partition does not exceed imbalance factor (%s); running refinement anyway "
+                    "per user request.",
+                    args.heavy_refinement_factor,
+                )
+            partition_assignment, comb_role_trackers = rebalance_heavy_partition(
+                partition_assignment,
+                comb_role_trackers,
+                document_index_to_roles,
+                logger,
+                target_partitions={largest_partition_id},
+            )
+            partition_assignment = clean_empty_partitions(partition_assignment)
+            partition_assignment, partition_mapping = reorganize_partitions(partition_assignment)
+            comb_role_trackers = remap_comb_role_trackers(comb_role_trackers, partition_mapping)
+            logger.info(
+                "Role refinement produced %s partitions after reindexing",
+                len(partition_assignment),
+            )
+            logger.info("Sample comb_role_trackers mapping (up to 10 entries):")
+            for idx, (comb, mapping) in enumerate(sorted(comb_role_trackers.items(), key=lambda item: item[0])):
+                logger.info("  comb=%s -> partitions=%s", comb, sorted(mapping.keys()))
+                if idx >= 9:
+                    break
+            tracked_partitions = sorted({
+                pid for partition_roles in comb_role_trackers.values() for pid in partition_roles.keys()
+            })
+            empty_mappings = [comb for comb, mapping in comb_role_trackers.items() if not mapping]
+            logger.info(
+                "comb_role_trackers covers %s combinations across %s partitions after refinement",
+                len(comb_role_trackers),
+                len(tracked_partitions),
+            )
+            if empty_mappings:
+                logger.warning(
+                    "Combinations with no partitions after refinement (showing up to 5): %s",
+                    empty_mappings[:5],
+                )
+
+    delete_faiss_files(project_root)
+
     converted_comb_role_trackers = {
-        comb: set(partition_roles.keys())  # Take the keys of partition_roles as the set of partition_ids
+        comb: set(partition_roles.keys())
         for comb, partition_roles in comb_role_trackers.items()
     }
 
-    roles_in_partition_0 = set()
-    # Iterate through comb_role_trackers to find roles in partition_id=0
-    for comb, partition_mapping in comb_role_trackers.items():
-        if 0 in partition_mapping:  # Check if partition_id=0 exists
-            roles_in_partition_0.update(partition_mapping[0])  # Collect roles
+    roles_in_partition_0: Set[int] = set()
+    for partition_mapping in comb_role_trackers.values():
+        if 0 in partition_mapping:
+            roles_in_partition_0.update(partition_mapping[0])
 
-    # Count the number of unique roles
-    count_roles_in_partition_0 = len(roles_in_partition_0)
-
-    logger.info("Number of unique roles assigned to partition_id 0: %d", count_roles_in_partition_0)
-
-    # delete partition index in acorn_benchmark
-    delete_faiss_files(project_root)
+    logger.info(
+        "Number of unique roles assigned to partition_id 0 after refinement: %d",
+        len(roles_in_partition_0),
+    )
 
     load_result_to_database(partition_assignment, converted_comb_role_trackers, increment_update=False)
-    initialize_dynamic_partition_tables_in_comb(index_type="hnsw")
+    initialize_dynamic_partition_tables_in_comb(index_type=None)
+    # initialize_dynamic_partition_tables_in_comb(index_type="hnsw")
     logger.info("done")

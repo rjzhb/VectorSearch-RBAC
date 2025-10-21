@@ -3,17 +3,16 @@ import json
 import sys
 import os
 
-from services.permission_analysis_role_level_sharing_degree_stack_figure import compute_role_sharing_degrees, \
-    plot_sharing_histogram
 
 project_root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.append(project_root)
 
+    
+from controller.dynamic_partition.hnsw.helper import fetch_initial_data
 from services.rbac_generator.common import convert_to_role_assignments, compute_average_selectivity, \
     convert_permissions_to_roles
 
 print(sys.path)
-from controller.dynamic_partition.helper import fetch_initial_data
 from services.rbac_generator.erbac_data_generator import ERBACDataGenerator
 
 from services.read_dataset_function import store_rbac_data
@@ -106,7 +105,7 @@ def main(num_documents):
         document_ids=document_ids,  # Use the specified number of documents
         m_perms=m_perms,  # Max permissions per functional role (one-tenth of num_documents)
         m_froles=3,       # Max functional roles per business role
-        m_broles=1        # Max business roles per user
+        m_broles=3        # Max business roles per user
     )
 
     # Generate data for 1000 users
@@ -159,8 +158,8 @@ if __name__ == '__main__':
     # Call main function with parsed argument
     main(len(documents))
 
-    roles, documents, permissions,_ = fetch_initial_data()
-
+    roles, documents, permissions, avg_blocks_per_document, user_to_roles = fetch_initial_data()
+    
     # Check for duplicate role permissions
     unique_permissions = set(permissions)
 

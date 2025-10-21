@@ -4,6 +4,8 @@ import re
 import sys
 import os
 import random
+import tarfile
+import shutil
 from concurrent.futures.process import ProcessPoolExecutor
 from datetime import datetime
 from psycopg2 import Binary
@@ -20,6 +22,10 @@ from services.rbac_generator.tree_based_rbac_data_generator import TreeBasedRBAC
 from services.embedding_service import generate_embedding
 from services.config import get_db_connection, get_dataset_path
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+SIFT_DOCUMENT_VECTOR_COUNT = 100  # Group 100 vectors into a single synthetic document
+SIFT10M_FEATURES_MEMBER = "SIFT10M/SIFT10Mfeatures.mat"
 
 
 def store_document(document_id, document_name):
@@ -300,11 +306,224 @@ def process_subset(data_subset, start_index, dataset_type):
 
     print(f"Processed subset starting at index {start_index}")
 
+def _ingest_numeric_vector_dataset(total_vectors, vector_dim, fetch_chunk, load_number, start_row,
+                                   dataset_label):
+    if start_row >= total_vectors:
+        print(f"Start row ({start_row}) is beyond {dataset_label} size ({total_vectors}); nothing to load.")
+        return
+
+    if load_number is None or load_number <= 0:
+        end_row = total_vectors
+    else:
+        end_row = min(total_vectors, start_row + load_number)
+
+    batch_start = start_row
+    vectors_processed = 0
+    log_threshold = max(BATCH_SIZE * 50, BATCH_SIZE)
+    next_log = log_threshold
+
+    while batch_start < end_row:
+        batch_end = min(batch_start + BATCH_SIZE, end_row)
+        vectors = fetch_chunk(batch_start, batch_end)
+
+        if vectors.shape != (batch_end - batch_start, vector_dim):
+            raise ValueError(
+                f"{dataset_label}: expected chunk shape {(batch_end - batch_start, vector_dim)} "
+                f"but received {vectors.shape}"
+            )
+
+        document_blocks = []
+        for offset, vector in enumerate(vectors):
+            global_index = batch_start + offset
+            document_id = (global_index // SIFT_DOCUMENT_VECTOR_COUNT) + 1
+            block_id = global_index + 1
+            vector_bytes = vector.tobytes()
+            block_content = Binary(b"")
+            hash_value = Binary(hashlib.sha1(vector_bytes).digest())
+            document_blocks.append(
+                (
+                    block_id,
+                    document_id,
+                    block_content,
+                    hash_value,
+                    vector.tolist(),
+                )
+            )
+
+        if document_blocks:
+            store_document_block_duplication_bulk(document_blocks)
+
+        vectors_processed += len(vectors)
+        if vectors_processed >= next_log or batch_end == end_row:
+            print(f"{dataset_label} loading progress: {vectors_processed} / {end_row - start_row} vectors processed.")
+            next_log += log_threshold
+
+        batch_start = batch_end
+
+    print(f"Finished loading {dataset_label} dataset.")
+
+
+def read_and_store_sift_dataset(load_number=1000, start_row=0):
+    """
+    Read vectors from the SIFT HDF5 dataset, group every 100 vectors into a document,
+    and persist both documents and document blocks.
+    """
+    try:
+        import h5py
+    except ImportError as exc:
+        raise ImportError("h5py is required to load the sift-128-euclidean dataset") from exc
+
+    dataset_path = get_dataset_path()
+    dataset_file = os.path.join(dataset_path, "sift-128-euclidean.hdf5")
+
+    if not os.path.exists(dataset_file):
+        raise FileNotFoundError(f"SIFT dataset not found at {dataset_file}. Please download it first.")
+
+    with h5py.File(dataset_file, "r") as h5_file:
+        if "train" in h5_file:
+            vector_dataset = h5_file["train"]
+        elif "base" in h5_file:
+            vector_dataset = h5_file["base"]
+        else:
+            raise KeyError("Unable to locate 'train' or 'base' dataset inside sift-128-euclidean.hdf5")
+
+        if len(vector_dataset.shape) != 2:
+            raise ValueError("Expected a 2D array for SIFT vectors.")
+
+        rows, cols = vector_dataset.shape
+        if cols <= rows:
+            total_vectors = rows
+            vector_dim = cols
+
+            def fetch_chunk(start, end):
+                chunk = vector_dataset[start:end, :]
+                return np.asarray(chunk, dtype=np.float32)
+
+        else:
+            total_vectors = cols
+            vector_dim = rows
+
+            def fetch_chunk(start, end):
+                chunk = vector_dataset[:, start:end]
+                return np.asarray(chunk, dtype=np.float32).T
+
+        print(f"Loading sift-128-euclidean vectors from row {start_row} to "
+              f"{'end' if load_number is None or load_number <= 0 else min(total_vectors, start_row + load_number)} "
+              f"(exclusive). Detected dimension: {vector_dim}.")
+
+        _ingest_numeric_vector_dataset(
+            total_vectors=total_vectors,
+            vector_dim=vector_dim,
+            fetch_chunk=fetch_chunk,
+            load_number=load_number,
+            start_row=start_row,
+            dataset_label="sift-128-euclidean"
+        )
+
+
+def _ensure_sift10m_features_file(dataset_path):
+    """
+    Ensure the SIFT10M features file is available on disk.
+    If only the tarball is present, extract the features matrix.
+    """
+    candidate_paths = [
+        os.path.join(dataset_path, "SIFT10M", "SIFT10Mfeatures.mat"),
+        os.path.join(dataset_path, "SIFT10Mfeatures.mat"),
+    ]
+
+    for path in candidate_paths:
+        if os.path.exists(path):
+            return path
+
+    tar_path = os.path.join(dataset_path, "SIFT10M.tar.gz")
+    if not os.path.exists(tar_path):
+        raise FileNotFoundError(
+            f"Unable to locate SIFT10Mfeatures.mat. Expected at one of {candidate_paths}, "
+            f"and no SIFT10M.tar.gz found at {tar_path}. Please download the dataset first."
+        )
+
+    print("SIFT10M features matrix not found, extracting from SIFT10M.tar.gz (this may take a while)...")
+    os.makedirs(os.path.join(dataset_path, "SIFT10M"), exist_ok=True)
+    target_path = os.path.join(dataset_path, "SIFT10M", "SIFT10Mfeatures.mat")
+
+    with tarfile.open(tar_path, "r:gz") as tar:
+        try:
+            member = tar.getmember(SIFT10M_FEATURES_MEMBER)
+        except KeyError as exc:
+            raise FileNotFoundError(
+                f"{SIFT10M_FEATURES_MEMBER} not found inside SIFT10M.tar.gz."
+            ) from exc
+
+        # Stream-copy the large MAT file to avoid loading into memory.
+        with tar.extractfile(member) as src, open(target_path, "wb") as dst:
+            shutil.copyfileobj(src, dst)
+
+    print(f"SIFT10M features extracted to {target_path}")
+    return target_path
+
+
+def read_and_store_sift10m_dataset(load_number=1000, start_row=0):
+    """
+    Read vectors from the SIFT10M MATLAB dataset, group every 100 vectors into a document,
+    and persist both documents and document blocks.
+    """
+    try:
+        import h5py
+    except ImportError as exc:
+        raise ImportError("h5py is required to load the SIFT10M dataset") from exc
+
+    dataset_path = get_dataset_path()
+    features_path = _ensure_sift10m_features_file(dataset_path)
+
+    with h5py.File(features_path, "r") as mat_file:
+        if "fea" not in mat_file:
+            raise KeyError("Unable to locate dataset 'fea' inside SIFT10Mfeatures.mat")
+
+        feature_dataset = mat_file["fea"]
+        if len(feature_dataset.shape) != 2:
+            raise ValueError("Expected a 2D array for SIFT10M features.")
+
+        rows, cols = feature_dataset.shape
+        if cols <= rows:
+            total_vectors = rows
+            vector_dim = cols
+
+            def fetch_chunk(start, end):
+                chunk = feature_dataset[start:end, :]
+                return np.asarray(chunk, dtype=np.float32)
+        else:
+            total_vectors = cols
+            vector_dim = rows
+
+            def fetch_chunk(start, end):
+                chunk = feature_dataset[:, start:end]
+                return np.asarray(chunk, dtype=np.float32).T
+
+        print(f"Loading SIFT10M vectors from row {start_row} to "
+              f"{'end' if load_number is None or load_number <= 0 else min(total_vectors, start_row + load_number)} "
+              f"(exclusive). Detected dimension: {vector_dim}.")
+
+        _ingest_numeric_vector_dataset(
+            total_vectors=total_vectors,
+            vector_dim=vector_dim,
+            fetch_chunk=fetch_chunk,
+            load_number=load_number,
+            start_row=start_row,
+            dataset_label="SIFT10M"
+        )
+
+
 def read_and_store_dataset_parallel(load_number=1000, start_row=0, num_threads=4, dataset="wikipedia-22-12"):
     # Load the dataset
     dataset_path = get_dataset_path()
     if dataset == "wikipedia-22-12":
         data = load_dataset("json", data_files=f"{dataset_path}/wikipedia-22-12/en/*.jsonl.gz")["train"]
+    elif dataset == "sift10m":
+        read_and_store_sift10m_dataset(load_number=load_number, start_row=start_row)
+        return
+    elif dataset == "sift-128-euclidean":
+        read_and_store_sift_dataset(load_number=load_number, start_row=start_row)
+        return
     elif dataset == "arxiv":
         arxiv_data_file = os.path.join(dataset_path, "arxiv/arxiv-metadata-oai-snapshot.json")
         data = load_dataset("json", data_files=arxiv_data_file)["train"]
@@ -841,5 +1060,3 @@ def load_queries_from_dataset(query_file):
         queries = json.load(infile)
 
     return queries
-
-

@@ -32,7 +32,11 @@ def test_row_level_security(iterations=3, enable_index=False, index_type="ivffla
             )
             drop_indexes()
         start_time = time.time()
-        create_indexes(index_type)
+        create_indexes(
+            index_type,
+            hnsw_m=16,
+            hnsw_ef_construction=64,
+        )
         time_taken = time.time() - start_time
         logger.info("Time taken to build index: %.2f seconds", time_taken)
         with open("non-indexed_time.json", "w") as json_file:

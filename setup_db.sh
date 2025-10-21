@@ -15,3 +15,7 @@ echo "Database setup completed!"
 
 # go to database command:
 # sudo -u postgres psql rbacdatabase_treebase
+
+# close and open PostgreSQL service:
+# sudo systemctl stop postgresql
+# sudo systemctl start postgresql

@@ -39,6 +39,16 @@ if __name__ == '__main__':
         b1=4  # Maximum number of children per internal node
     )
 
+    #eg2: if you want to improve number of roles, you can adjust h, b0, b1
+    # rbac_generator = TreeBasedRBACDataGenerator(
+    #     num_users=1000,
+    #     num_roles=300,
+    #     document_ids=document_ids,  # Use actual document_ids from the dataset
+    #     h=6,  # Tree height (can adjust based on requirements)
+    #     b0=3,  # Minimum number of children per internal node
+    #     b1=4  # Maximum number of children per internal node
+    # )
+
     # Generate users, user roles, and permission assignments based on the tree-based RBAC model
     users, user_roles, document_assignments, permission_assignments = rbac_generator.generate_rbac_data()
 

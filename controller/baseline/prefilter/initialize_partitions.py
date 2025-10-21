@@ -4,12 +4,27 @@ import os
 import sys
 from concurrent.futures import ProcessPoolExecutor
 
-import psutil
 import psycopg2
 from psycopg2 import sql
 
 from controller.clear_database import clear_tables
-from services.config import get_db_connection
+from services.config import get_db_connection, get_maintenance_settings, get_document_vector_dimension
+
+
+def _configure_index_session(cur, disable_sync_commit=True, hnsw_threads=None):
+    """
+    Apply session-level settings that speed up bulk index builds.
+    """
+    maintenance_settings = get_maintenance_settings()
+    maintenance_work_mem_gb = maintenance_settings["maintenance_work_mem_gb"]
+    max_parallel_maintenance_workers = maintenance_settings["max_parallel_maintenance_workers"]
+
+    cur.execute(f"SET maintenance_work_mem = '{maintenance_work_mem_gb}GB';")
+    cur.execute(f"SET max_parallel_maintenance_workers = {max_parallel_maintenance_workers};")
+    if disable_sync_commit:
+        cur.execute("SET synchronous_commit = OFF;")
+    if hnsw_threads:
+        cur.execute(f"SET hnsw.threads = {int(hnsw_threads)};")
 
 
 def drop_prefilter_partition_tables(condition="role"):
@@ -88,6 +103,7 @@ def drop_prefilter_partition_tables(condition="role"):
 def initialize_user_partitions(enable_index=False):
     conn = get_db_connection()
     cur = conn.cursor()
+    vector_dimension = get_document_vector_dimension()
 
     try:
         # Retrieve all user_ids and create an independent table for each user
@@ -100,16 +116,17 @@ def initialize_user_partitions(enable_index=False):
                 # Create an independent table for each user
                 cur.execute(
                     sql.SQL("""
-                               CREATE TABLE IF NOT EXISTS {} (
+                               CREATE TABLE IF NOT EXISTS {table} (
                                    id SERIAL PRIMARY KEY,
-                                   block_id INT NOT NULL,
+                                   block_id BIGINT NOT NULL,
                                    document_id INT NOT NULL REFERENCES Documents(document_id),
                                    block_content BYTEA NOT NULL,
-                                   vector VECTOR(300),
+                                   vector VECTOR({dimension}),
                                    user_id INT NOT NULL REFERENCES Users(user_id),
                                    UNIQUE (block_id, document_id, user_id)
                                );
-                           """).format(sql.Identifier(table_name))
+                           """).format(table=sql.Identifier(table_name),
+                                       dimension=sql.SQL(str(vector_dimension)))
                 )
                 conn.commit()
 
@@ -241,84 +258,90 @@ def verify_documentblocks_consistency():
         conn.close()
 
 
-def process_role_partition(role_id, enable_index=False, index_type="ivfflat"):
+def process_role_partition(role_id, enable_index=False, index_type="ivfflat", vector_dimension=300):
     conn = get_db_connection()
     cur = conn.cursor()
     table_name = f"documentblocks_role_{role_id}"
 
-    # Get system information
-    total_memory_gb = psutil.virtual_memory().total / (1024 ** 3)  # Total memory in GB
-    cpu_cores = os.cpu_count() # Total CPU cores
-
-    # # Calculate recommended settings
-    maintenance_work_mem_gb = max(1, int(total_memory_gb / 0.5))  # Use 50% of total memory, at least 1GB
-    max_parallel_maintenance_workers = max(1, cpu_cores)  # Half of the CPU cores, at least 1
+    # Load maintenance settings from config for repeatable behaviour
+    maintenance_settings = get_maintenance_settings()
+    maintenance_work_mem_gb = maintenance_settings["maintenance_work_mem_gb"]
+    max_parallel_maintenance_workers = maintenance_settings["max_parallel_maintenance_workers"]
 
     # Set PostgreSQL parameters for optimal index creation
     cur.execute(f"SET maintenance_work_mem = '{maintenance_work_mem_gb}GB';")
     cur.execute(f"SET max_parallel_maintenance_workers = {max_parallel_maintenance_workers};")
     print(f"PostgreSQL parameters set: maintenance_work_mem = {maintenance_work_mem_gb}GB, "
           f"max_parallel_maintenance_workers = {max_parallel_maintenance_workers}")
-    try:
-        # Create an independent table for each role
-        cur.execute(
-            sql.SQL("""
-                CREATE TABLE IF NOT EXISTS {} (
-                    block_id INT NOT NULL,
-                    document_id INT NOT NULL,
-                    block_content BYTEA NOT NULL,
-                    vector VECTOR(300),
-                    role_id INT NOT NULL,
-                    UNIQUE (block_id, document_id, role_id)
-                );
-            """).format(sql.Identifier(table_name))
-        )
-        conn.commit()
-
-        if enable_index:
-            # Dynamically create vector index based on the index type (HNSW or IVFFlat)
-            if index_type.lower() == "hnsw":
-                cur.execute(
-                    sql.SQL("""
-                        CREATE INDEX IF NOT EXISTS {} 
-                        ON {} USING hnsw (vector vector_l2_ops)
-                        WITH (m = 16, ef_construction = 64);
-                    """).format(sql.Identifier(f"{table_name}_vector_idx"), sql.Identifier(table_name))
-                )
-                print(f"HNSW index created for {table_name}.")
-            elif index_type.lower() == "ivfflat":
-                cur.execute(
-                    sql.SQL("""
-                        CREATE INDEX IF NOT EXISTS {} 
-                        ON {} USING ivfflat (vector vector_l2_ops);
-                    """).format(sql.Identifier(f"{table_name}_vector_idx"), sql.Identifier(table_name))
-                )
-                print(f"IVFFlat index created for {table_name}.")
-            else:
-                print(f"Unknown index type: {index_type}. Please use 'hnsw' or 'ivfflat'.")
-
-        conn.commit()
-
-    except psycopg2.Error as e:
-        print(f"Error creating table for role_id {role_id}: {e}")
-        conn.rollback()
+    data_inserted = False
 
     try:
-        # Insert data based on role_id and document_id
-        cur.execute(
-            sql.SQL("""
-                INSERT INTO {} (block_id, document_id, block_content, vector, role_id)
-                SELECT DISTINCT db.block_id, db.document_id, db.block_content, db.vector, pa.role_id
-                FROM documentblocks db
-                JOIN PermissionAssignment pa ON db.document_id = pa.document_id
-                WHERE pa.role_id = %s;
-            """).format(sql.Identifier(table_name)),
-            [role_id]
-        )
-        conn.commit()
-    except psycopg2.Error as e:
-        print(f"Error inserting data into table for role_id {role_id}: {e}")
-        conn.rollback()
+        try:
+            # Create an independent table for each role
+            cur.execute(
+                sql.SQL("""
+                    CREATE TABLE IF NOT EXISTS {table} (
+                        block_id BIGINT NOT NULL,
+                        document_id INT NOT NULL,
+                        block_content BYTEA NOT NULL,
+                        vector VECTOR({dimension}),
+                        role_id INT NOT NULL,
+                        UNIQUE (block_id, document_id, role_id)
+                    );
+                """).format(table=sql.Identifier(table_name),
+                            dimension=sql.SQL(str(vector_dimension)))
+            )
+            conn.commit()
+        except psycopg2.Error as e:
+            print(f"Error creating table for role_id {role_id}: {e}")
+            conn.rollback()
+            return
+
+        try:
+            # Insert data based on role_id and document_id
+            cur.execute(
+                sql.SQL("""
+                    INSERT INTO {} (block_id, document_id, block_content, vector, role_id)
+                    SELECT DISTINCT db.block_id, db.document_id, db.block_content, db.vector, pa.role_id
+                    FROM documentblocks db
+                    JOIN PermissionAssignment pa ON db.document_id = pa.document_id
+                    WHERE pa.role_id = %s;
+                """).format(sql.Identifier(table_name)),
+                [role_id]
+            )
+            conn.commit()
+            data_inserted = True
+        except psycopg2.Error as e:
+            print(f"Error inserting data into table for role_id {role_id}: {e}")
+            conn.rollback()
+
+        if enable_index and data_inserted:
+            try:
+                # Dynamically create vector index based on the index type (HNSW or IVFFlat)
+                if index_type.lower() == "hnsw":
+                    cur.execute(
+                        sql.SQL("""
+                            CREATE INDEX IF NOT EXISTS {} 
+                            ON {} USING hnsw (vector vector_l2_ops)
+                            WITH (m = 16, ef_construction = 64);
+                        """).format(sql.Identifier(f"{table_name}_vector_idx"), sql.Identifier(table_name))
+                    )
+                    print(f"HNSW index created for {table_name}.")
+                elif index_type.lower() == "ivfflat":
+                    cur.execute(
+                        sql.SQL("""
+                            CREATE INDEX IF NOT EXISTS {} 
+                            ON {} USING ivfflat (vector vector_l2_ops);
+                        """).format(sql.Identifier(f"{table_name}_vector_idx"), sql.Identifier(table_name))
+                    )
+                    print(f"IVFFlat index created for {table_name}.")
+                else:
+                    print(f"Unknown index type: {index_type}. Please use 'hnsw' or 'ivfflat'.")
+
+                conn.commit()
+            except psycopg2.Error as e:
+                print(f"Error creating index for role_id {role_id}: {e}")
+                conn.rollback()
     finally:
         cur.close()
         conn.close()
@@ -334,11 +357,12 @@ def initialize_role_partitions(enable_index=False, index_type="ivfflat"):
     cur.close()
     conn.close()
 
+    vector_dimension = get_document_vector_dimension()
 
     # Process each role in parallel using ProcessPoolExecutor
     with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
         futures = [
-            executor.submit(process_role_partition, role_id[0], enable_index, index_type)
+            executor.submit(process_role_partition, role_id[0], enable_index, index_type, vector_dimension)
             for role_id in roles
         ]
 
@@ -350,20 +374,31 @@ def initialize_role_partitions(enable_index=False, index_type="ivfflat"):
 
 
 
-def create_index_for_role(role_id, index_type="ivfflat"):
+def create_index_for_role(role_id, index_type="ivfflat", hnsw_m=16, hnsw_ef_construction=64,
+                          hnsw_threads=None, disable_sync_commit=True):
     conn = get_db_connection()
     cur = conn.cursor()
     table_name = f"documentblocks_role_{role_id}"
 
     try:
+        _configure_index_session(cur, disable_sync_commit=disable_sync_commit, hnsw_threads=hnsw_threads)
+
         # Dynamically create vector index based on the index type (HNSW or IVFFlat)
         if index_type.lower() == "hnsw":
+            with_clause = sql.SQL("WITH (m = {m}, ef_construction = {ef})").format(
+                m=sql.Literal(int(hnsw_m)),
+                ef=sql.Literal(int(hnsw_ef_construction))
+            )
             cur.execute(
                 sql.SQL("""
                     CREATE INDEX IF NOT EXISTS {} 
                     ON {} USING hnsw (vector vector_l2_ops)
-                    WITH (m = 16, ef_construction = 64);
-                """).format(sql.Identifier(f"{table_name}_vector_idx"), sql.Identifier(table_name))
+                    {with_clause};
+                """).format(
+                    sql.Identifier(f"{table_name}_vector_idx"),
+                    sql.Identifier(table_name),
+                    with_clause=with_clause
+                )
             )
             print(f"HNSW index created for {table_name}.")
         elif index_type.lower() == "ivfflat":
@@ -386,7 +421,9 @@ def create_index_for_role(role_id, index_type="ivfflat"):
         cur.close()
         conn.close()
 
-def create_indexes_for_all_role_tables(index_type="ivfflat", parallel = True):
+def create_indexes_for_all_role_tables(index_type="ivfflat", parallel=True, max_workers=None,
+                                       hnsw_m=16, hnsw_ef_construction=64, hnsw_threads=None,
+                                       disable_sync_commit=True):
     conn = get_db_connection()
     cur = conn.cursor()
 
@@ -394,27 +431,23 @@ def create_indexes_for_all_role_tables(index_type="ivfflat", parallel = True):
     cur.execute("SELECT role_id FROM Roles;")
     roles = cur.fetchall()
 
-    # Get system information
-    total_memory_gb = psutil.virtual_memory().total / (1024 ** 3)  # Total memory in GB
-    cpu_cores = os.cpu_count()  # Total CPU cores
-
-    # # Calculate recommended settings
-    maintenance_work_mem_gb = max(1, int(total_memory_gb / 0.5))  # Use 50% of total memory, at least 1GB
-    max_parallel_maintenance_workers = max(1, cpu_cores)  # Half of the CPU cores, at least 1
-
-    # Set PostgreSQL parameters for optimal index creation
-    cur.execute(f"SET maintenance_work_mem = '{maintenance_work_mem_gb}GB';")
-    cur.execute(f"SET max_parallel_maintenance_workers = {max_parallel_maintenance_workers};")
-    print(f"PostgreSQL parameters set: maintenance_work_mem = {maintenance_work_mem_gb}GB, "
-          f"max_parallel_maintenance_workers = {max_parallel_maintenance_workers}")
     cur.close()
     conn.close()
 
     if parallel:
         # Process each role in parallel using ProcessPoolExecutor
-        with ProcessPoolExecutor(max_workers=os.cpu_count()//2) as executor:
+        worker_count = max_workers or max(1, os.cpu_count() // 2)
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
             futures = [
-                executor.submit(create_index_for_role, role_id[0], index_type)
+                executor.submit(
+                    create_index_for_role,
+                    role_id[0],
+                    index_type,
+                    hnsw_m,
+                    hnsw_ef_construction,
+                    hnsw_threads,
+                    disable_sync_commit
+                )
                 for role_id in roles
             ]
 
@@ -425,7 +458,14 @@ def create_indexes_for_all_role_tables(index_type="ivfflat", parallel = True):
         print("Finished creating indexes for all role tables.")
     else:
         for role_id in roles:
-            create_index_for_role(role_id[0], index_type)
+            create_index_for_role(
+                role_id[0],
+                index_type,
+                hnsw_m,
+                hnsw_ef_construction,
+                hnsw_threads,
+                disable_sync_commit
+            )
 
 
 def drop_indexes_for_all_role_tables():
@@ -526,6 +566,8 @@ def initialize_combination_partitions(enable_index=False, index_type="ivfflat"):
 
     print(f"Divided {len(role_combinations)} role combinations into {len(role_combination_chunks)} chunks.")
 
+    vector_dimension = get_document_vector_dimension()
+
     # Process each chunk in parallel
     with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = [
@@ -533,7 +575,8 @@ def initialize_combination_partitions(enable_index=False, index_type="ivfflat"):
                 process_combination_partition_chunk,
                 chunk,
                 enable_index,
-                index_type
+                index_type,
+                vector_dimension
             )
             for chunk in role_combination_chunks
         ]
@@ -544,7 +587,7 @@ def initialize_combination_partitions(enable_index=False, index_type="ivfflat"):
 
     print("Finished initializing all combination partitions.")
 
-def process_combination_partition_chunk(role_combination_chunk, enable_index, index_type):
+def process_combination_partition_chunk(role_combination_chunk, enable_index, index_type, vector_dimension):
     """
     Process a chunk of role combinations to create combination partitions.
 
@@ -558,13 +601,13 @@ def process_combination_partition_chunk(role_combination_chunk, enable_index, in
     """
     for role_combination in role_combination_chunk:
         try:
-            process_combination_partition(role_combination, enable_index, index_type)
+            process_combination_partition(role_combination, enable_index, index_type, vector_dimension)
             print(f"Successfully processed combination partition for roles: {role_combination}")
         except Exception as e:
             print(f"Error processing combination partition for roles {role_combination}: {e}")
 
 
-def process_combination_partition(roles, enable_index=False, index_type="ivfflat"):
+def process_combination_partition(roles, enable_index=False, index_type="ivfflat", vector_dimension=300):
     """
     Create and populate a table for a specific combination of roles.
 
@@ -586,14 +629,17 @@ def process_combination_partition(roles, enable_index=False, index_type="ivfflat
         # Create a table for the role combination
         cur.execute(
             sql.SQL("""
-                CREATE TABLE IF NOT EXISTS {} (
-                    block_id INT NOT NULL,
+                CREATE TABLE IF NOT EXISTS {table} (
+                    block_id BIGINT NOT NULL,
                     document_id INT NOT NULL,
                     block_content BYTEA NOT NULL,
-                    vector VECTOR(300),
+                    vector VECTOR({dimension}),
                     UNIQUE (block_id, document_id)
                 );
-            """).format(sql.Identifier(table_name))
+            """).format(
+                table=sql.Identifier(table_name),
+                dimension=sql.SQL(str(vector_dimension))
+            )
         )
         conn.commit()
 

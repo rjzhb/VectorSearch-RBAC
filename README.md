@@ -89,6 +89,11 @@ git lfs install
 git clone https://huggingface.co/datasets/Cohere/wikipedia-22-12
 ```
 
+- [SIFT10M features](https://people.otago.ac.nz/xipingfu/SIFT10M.html) (Fu et al.)
+  - Download `SIFT10M.tar.gz` and place it in the directory pointed to by `dataset_path` (defaults to `/data`).
+  - The loader extracts `SIFT10M/SIFT10Mfeatures.mat` automatically on first run, or you can run  
+    `tar -xf SIFT10M.tar.gz SIFT10M/SIFT10Mfeatures.mat`.
+
 
 ### Configure database config file
 
@@ -136,8 +141,20 @@ Then set `"use_gpu_groundtruth": true` in `config.json`.
 ### Prepare Data
 ```sh
 cd basic_benchmark
-# adjust load_number to controll data scalability
-python3 common_prepare_pipeline.py
+# Load the default Wikipedia dataset (1M rows by default)
+python3 common_prepare_pipeline.py --dataset wikipedia-22-12
+
+# Example: load the SIFT 1M benchmark vectors (load-number 0 loads the entire file)
+python3 common_prepare_pipeline.py --dataset sift-128-euclidean --load-number 0
+
+# Example: load the 10M SIFT feature matrix (auto-extracts SIFT10Mfeatures.mat if needed)
+python3 common_prepare_pipeline.py --dataset sift10m --load-number 0
+
+# Flags:
+#   --dataset       One of {wikipedia-22-12, arxiv, sift-128-euclidean, sift10m}
+#   --load-number   Number of rows to ingest (0 or negative means “all remaining rows”)
+#   --start-row     Offset within the dataset before loading
+#   --num-threads   Worker processes used for ingestion (defaults to CPU count)
 
 go to controller directory
 # prepare main tables(user/role/permission) index
@@ -155,13 +172,16 @@ python3 store_tree_based_rbac_generate_data.py
 ```shell
 go to basic_benchmark
 # initialize role partition
-python3 initialize_role_partition_tables.py
+python3 initialize_role_partition_tables.py --index_type hnsw
 
 # (optional) initialize user partition
-python3 initialize_combination_role_partition_tables.py
+python3 initialize_combination_role_partition_tables.py --index_type hnsw
 
 # generate queries
-python3 generate_queries.py --num_queries 1000 --topk 10 --num_threads 4
+python3 generate_queries.py --num_queries 1000 --topk 100 --num_threads 4
+
+# compute ground truth (pointer benchmark & tests share cache)
+python3 compute_ground_truth.py
 ```
 
 **Ground Truth Caching:**
@@ -177,17 +197,16 @@ python3 generate_queries.py --num_queries 1000 --topk 10 --num_threads 4
 go to controller/dynamic_partition/hnsw
 # if needed, delete parameter_hnsw.json from hnsw directory to regenerate parameters
 python3 AnonySys_dynamic_partition.py --storage 2.0 --recall 0.95
-```
 
 Run(HNSW index)
 ```sh
 go to basic_benchmark directory
 
 # example:
-python test_all.py --algorithm RLS --efs 20 30 40 50
-python test_all.py --algorithm ROLE --efs 20 30 40 50
-python test_all.py --algorithm USER --efs 20 30 40 50
-python test_all.py --algorithm AnonySys --efs 20 30 40 50
+python test_all.py --algorithm RLS --efs 500
+python test_all.py --algorithm ROLE --efs 20
+python test_all.py --algorithm USER --efs 20
+python test_all.py --algorithm AnonySys --efs 40
 ```
 
 

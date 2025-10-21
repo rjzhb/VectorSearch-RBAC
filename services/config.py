@@ -20,6 +20,17 @@ def get_dataset_path():
     """
     return config.get("dataset_path", "../dataset")
 
+def get_maintenance_settings():
+    """
+    Retrieve maintenance-related PostgreSQL settings from config with safe defaults.
+    """
+    maintenance_work_mem_gb = int(config.get("maintenance_work_mem_gb", 1))
+    max_parallel_workers = int(config.get("max_parallel_maintenance_workers", 1))
+    return {
+        "maintenance_work_mem_gb": max(1, maintenance_work_mem_gb),
+        "max_parallel_maintenance_workers": max(1, max_parallel_workers),
+    }
+
 def get_db_connection():
     return psycopg2.connect(
         dbname=config["dbname"],
@@ -155,6 +166,45 @@ def release_db_connection(user_id, conn):
         connection_pool[pool_key].putconn(conn)
     else:
         raise ValueError(f"No connection pool found for user_id: {pool_key}")
+
+
+def get_document_vector_dimension(default=300):
+    """
+    Inspect the documentblocks.vector column and return its configured dimension.
+    Falls back to `default` when the column is missing or dimension cannot be read.
+    """
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute("""
+            SELECT format_type(atttypid, atttypmod)
+            FROM pg_attribute
+            WHERE attrelid = 'documentblocks'::regclass
+              AND attname = 'vector'
+              AND NOT attisdropped;
+        """)
+        row = cur.fetchone()
+        if row and row[0]:
+            type_str = row[0]
+            if "vector" in type_str:
+                import re
+                match = re.search(r'vector\((\d+)\)', type_str)
+                if match:
+                    return int(match.group(1))
+        # Fallback: attempt to read a sample row if available
+        try:
+            cur.execute("SELECT vector_dims(vector) FROM documentblocks LIMIT 1;")
+            sample = cur.fetchone()
+            if sample and sample[0]:
+                return int(sample[0])
+        except psycopg2.Error:
+            pass
+    except psycopg2.Error as exc:
+        print(f"Unable to determine vector dimension, defaulting to {default}: {exc}")
+    finally:
+        cur.close()
+        conn.close()
+    return default
 
 
 def close_all_user_connections():

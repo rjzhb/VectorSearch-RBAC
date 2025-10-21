@@ -1,4 +1,5 @@
 from concurrent.futures import ProcessPoolExecutor
+from typing import Optional
 
 import psycopg2
 from psycopg2 import sql
@@ -11,7 +12,24 @@ sys.path.append(project_root)
 
 from controller.dynamic_partition.hnsw.helper import fetch_initial_data, prepare_background_data
 
-from services.config import get_db_connection
+from services.config import get_db_connection, get_maintenance_settings, get_document_vector_dimension
+
+
+def _configure_index_session(cur, disable_sync_commit: bool = True, hnsw_threads: Optional[int] = None) -> None:
+    """
+    Apply session-level settings that significantly speed up bulk index creation.
+    Mirrors the role-partition pipeline defaults so both flows behave similarly.
+    """
+    maintenance_settings = get_maintenance_settings()
+    maintenance_work_mem_gb = maintenance_settings["maintenance_work_mem_gb"]
+    max_parallel_maintenance_workers = maintenance_settings["max_parallel_maintenance_workers"]
+
+    cur.execute(f"SET maintenance_work_mem = '{maintenance_work_mem_gb}GB';")
+    cur.execute(f"SET max_parallel_maintenance_workers = {max_parallel_maintenance_workers};")
+    if disable_sync_commit:
+        cur.execute("SET synchronous_commit = OFF;")
+    if hnsw_threads:
+        cur.execute(f"SET hnsw.threads = {int(hnsw_threads)};")
 
 
 def validate_partition_coverage(cur, accessible_partitions, document_to_index):
@@ -97,6 +115,7 @@ def create_and_populate_partition_table_increment(partition_id, partition_assign
     conn = get_db_connection()
     cur = conn.cursor()
     partition_table_name = f"documentblocks_partition_{partition_id}"
+    vector_dimension = get_document_vector_dimension()
 
     try:
         # Step 1: Check if the table already exists
@@ -132,14 +151,17 @@ def create_and_populate_partition_table_increment(partition_id, partition_assign
         # Create the partition table
         cur.execute(
             sql.SQL("""
-                CREATE TABLE {} (
-                    block_id INT NOT NULL,
+                CREATE TABLE {table} (
+                    block_id BIGINT NOT NULL,
                     document_id INT NOT NULL REFERENCES Documents(document_id),
                     block_content BYTEA NOT NULL,
-                    vector VECTOR(300),
+                    vector VECTOR({dimension}),
                     PRIMARY KEY (block_id, document_id)
                 );
-            """).format(sql.Identifier(partition_table_name))
+            """).format(
+                table=sql.Identifier(partition_table_name),
+                dimension=sql.SQL(str(vector_dimension))
+            )
         )
         conn.commit()
 
@@ -178,19 +200,23 @@ def create_and_populate_partition_table(partition_id, partition_assignment, docu
     conn = get_db_connection()
     cur = conn.cursor()
     partition_table_name = f"documentblocks_partition_{partition_id}"
+    vector_dimension = get_document_vector_dimension()
 
     try:
         # Step 1: Create the partition table
         cur.execute(
             sql.SQL("""
-                CREATE TABLE IF NOT EXISTS {} (
-                    block_id INT NOT NULL,
+                CREATE TABLE IF NOT EXISTS {table} (
+                    block_id BIGINT NOT NULL,
                     document_id INT NOT NULL REFERENCES Documents(document_id),
                     block_content BYTEA NOT NULL,
-                    vector VECTOR(300),
+                    vector VECTOR({dimension}),
                     PRIMARY KEY (block_id, document_id)
                 );
-            """).format(sql.Identifier(partition_table_name))
+            """).format(
+                table=sql.Identifier(partition_table_name),
+                dimension=sql.SQL(str(vector_dimension))
+            )
         )
         conn.commit()
         print(f"Partition table {partition_table_name} created.")
@@ -312,22 +338,37 @@ def initialize_partitions_and_role_mappings(partition_assignment, comb_role_trac
     print("All partitions and role mappings have been processed.")
 
 
-def create_index_for_partition(table_name, index_type="ivfflat"):
+def create_index_for_partition(
+    table_name,
+    index_type="ivfflat",
+    *,
+    hnsw_m: int = 16,
+    hnsw_ef_construction: int = 64,
+    hnsw_threads: Optional[int] = None,
+    disable_sync_commit: bool = True,
+):
     """
     Create an index for a specific partition table.
     """
     conn = get_db_connection()
     cur = conn.cursor()
     try:
+        _configure_index_session(
+            cur,
+            disable_sync_commit=disable_sync_commit,
+            hnsw_threads=hnsw_threads,
+        )
         if index_type.lower() == "hnsw":
             cur.execute(
                 sql.SQL("""
                     CREATE INDEX IF NOT EXISTS {} 
                     ON {} USING hnsw (vector vector_l2_ops)
-                    WITH (m = 16, ef_construction = 64);
+                    WITH (m = {m}, ef_construction = {ef});
                 """).format(
                     sql.Identifier(f"{table_name}_vector_idx"),
-                    sql.Identifier(table_name)
+                    sql.Identifier(table_name),
+                    m=sql.Literal(int(hnsw_m)),
+                    ef=sql.Literal(int(hnsw_ef_construction)),
                 )
             )
             print(f"HNSW index created for {table_name}.")
@@ -351,25 +392,34 @@ def create_index_for_partition(table_name, index_type="ivfflat"):
         conn.close()
 
 
-def create_indexes_for_all_partitions(index_type="ivfflat"):
+def create_indexes_for_all_partitions(
+    index_type="ivfflat",
+    *,
+    parallel: bool = True,
+    max_workers: Optional[int] = None,
+    hnsw_m: int = 16,
+    hnsw_ef_construction: int = 64,
+    hnsw_threads: Optional[int] = None,
+    disable_sync_commit: bool = True,
+):
     """
     Create indexes for all partition tables in parallel.
     """
     conn = get_db_connection()
     cur = conn.cursor()
-    import psutil
-    import os
-    # Get system memory and calculate recommended settings
-    total_memory_gb = psutil.virtual_memory().total / (1024 ** 3)  # Total memory in GB
-    cpu_cores = os.cpu_count()  # Total CPU cores
-    maintenance_work_mem_gb = max(1, int(total_memory_gb * 0.5))  # 1GB minimum
-    max_parallel_maintenance_workers = max(1, cpu_cores // 2)  # Half of the CPU cores, at least 1
+    maintenance_settings = get_maintenance_settings()
+    maintenance_work_mem_gb = maintenance_settings["maintenance_work_mem_gb"]
+    max_parallel_maintenance_workers = maintenance_settings["max_parallel_maintenance_workers"]
 
-    # Set PostgreSQL parameters for optimal index creation
-    cur.execute(f"SET maintenance_work_mem = '{maintenance_work_mem_gb}GB';")
-    cur.execute(f"SET max_parallel_maintenance_workers = {max_parallel_maintenance_workers};")
-    print(f"PostgreSQL parameters set: maintenance_work_mem = {maintenance_work_mem_gb}GB, "
-          f"max_parallel_maintenance_workers = {max_parallel_maintenance_workers}")
+    _configure_index_session(
+        cur,
+        disable_sync_commit=disable_sync_commit,
+        hnsw_threads=hnsw_threads,
+    )
+    print(
+        "PostgreSQL parameters set: maintenance_work_mem = "
+        f"{maintenance_work_mem_gb}GB, max_parallel_maintenance_workers = {max_parallel_maintenance_workers}"
+    )
     try:
         # Retrieve all partition tables
         cur.execute("""
@@ -388,19 +438,44 @@ def create_indexes_for_all_partitions(index_type="ivfflat"):
     cur.close()
     conn.close()
 
-    # Process each partition table in parallel
-    with ProcessPoolExecutor(max_workers=os.cpu_count()) as executor:
-        futures = [
-            executor.submit(create_index_for_partition, table_name, index_type)
-            for table_name in partition_tables
-        ]
+    if not partition_tables:
+        print("No dynamic partition tables found. Skipping index creation.")
+        return
 
-        # Wait for all futures to complete
-        for future in futures:
-            try:
-                future.result()
-            except Exception as e:
-                print(f"Error in parallel execution: {e}")
+    worker_count = max_workers or max(1, os.cpu_count() // 2)
+
+    if parallel and worker_count > 1:
+        # Process each partition table in parallel
+        with ProcessPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(
+                    create_index_for_partition,
+                    table_name,
+                    index_type,
+                    hnsw_m=hnsw_m,
+                    hnsw_ef_construction=hnsw_ef_construction,
+                    hnsw_threads=hnsw_threads,
+                    disable_sync_commit=disable_sync_commit,
+                )
+                for table_name in partition_tables
+            ]
+
+            # Wait for all futures to complete
+            for future in futures:
+                try:
+                    future.result()
+                except Exception as e:
+                    print(f"Error in parallel execution: {e}")
+    else:
+        for table_name in partition_tables:
+            create_index_for_partition(
+                table_name,
+                index_type,
+                hnsw_m=hnsw_m,
+                hnsw_ef_construction=hnsw_ef_construction,
+                hnsw_threads=hnsw_threads,
+                disable_sync_commit=disable_sync_commit,
+            )
 
     print("Finished creating indexes for all partition tables.")
 

@@ -1,9 +1,11 @@
 {
-    "dbname": "rbacdatabase_treebase",
+    "dbname": "rbacdatabase_sift1m",
     "user": "x",
     "password": "123",
     "host": "localhost",
     "port": "5432",
+    "maintenance_work_mem_gb": 2,
+    "max_parallel_maintenance_workers": 10,
     "dataset_path": "/data",
-    "use_gpu_groundtruth": true
+    "use_gpu_groundtruth": false
 }

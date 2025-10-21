@@ -39,7 +39,11 @@ def test_partition_prefilter_role(iterations=3, enable_index=False, index_type="
 
         import time
         start_time = time.time()
-        create_indexes_for_all_role_tables(index_type)
+        create_indexes_for_all_role_tables(
+            index_type,
+            hnsw_m=16,
+            hnsw_ef_construction=64,
+        )
         time_taken = time.time() - start_time
         logger.info(
             "initialize prefilter role partition indexing time cost: %.2f seconds",

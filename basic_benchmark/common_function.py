@@ -877,23 +877,25 @@ def ground_truth_func_batch(queries, use_faiss=None, use_cache=True):
             with open(cache_file, 'r') as f:
                 cached_data = json.load(f)
 
-            # Verify cache matches current queries
-            if len(cached_data) == len(queries):
-                # Quick check: compare first and last query
-                def query_matches(q1, q2):
-                    return (q1['user_id'] == q2['user_id'] and
-                            q1.get('topk', 5) == q2.get('topk', 5) and
-                            q1['query_vector'] == q2['query_vector'])
-
-                if query_matches(queries[0], cached_data[0]['query']) and \
-                   query_matches(queries[-1], cached_data[-1]['query']):
-                    print(f"✓ Ground truth cache valid! Loaded {len(cached_data)} results")
-                    # Extract just the results
-                    return [item['ground_truth'] for item in cached_data]
+            if len(cached_data) >= len(queries):
+                subset = cached_data[:len(queries)]
+                if len(cached_data) > len(queries):
+                    print(
+                        f"✓ Ground truth cache larger than needed ({len(cached_data)}); "
+                        f"using first {len(queries)} entries"
+                    )
                 else:
-                    print("Cache exists but queries don't match, recomputing...")
+                    print(f"✓ Ground truth cache valid! Loaded {len(subset)} results")
+
+                cached_results = []
+                for entry in subset:
+                    if isinstance(entry, dict):
+                        cached_results.append(entry.get("ground_truth", []))
+                    else:
+                        cached_results.append(entry)
+                return cached_results
             else:
-                print(f"Cache exists but size mismatch ({len(cached_data)} vs {len(queries)}), recomputing...")
+                print(f"Cache size mismatch ({len(cached_data)} vs {len(queries)}), recomputing...")
         except Exception as e:
             print(f"Error loading cache: {e}, recomputing...")
 
@@ -1146,10 +1148,6 @@ def prepare_query_dataset(regenerate=True, num_queries=1000):
     # Load queries from the dataset
     queries = load_queries_from_dataset(query_dataset_file)
 
-    # Print the loaded queries for inspection
-    for query in queries:
-        print(f"User {query['user_id']} with query vector: {query['query_vector']} and topk: {query.get('topk', 5)}")
-
     return queries
 
 
@@ -1291,7 +1289,7 @@ def run_test(
     print(f"Average Query Time: {avg_query_time_final:.4f} seconds")
 
     # Calculate space used based on condition
-    space_used_mb = space_calc_func(condition)
+    space_used_mb = space_calc_func(condition, enable_index=enable_index)
 
     print(f"Space used: {space_used_mb:.2f} MB")
 
@@ -1358,6 +1356,10 @@ def run_search_experiment(queries, search_func, queries_num=None, statistics_typ
         query_vector = query["query_vector"]
         topk = query.get("topk", 5)
 
+        # Progress logging every 100 queries
+        if (i + 1) % 100 == 0:
+            print(f"Progress: {i + 1}/{len(queries_to_process)} queries processed")
+
         query_total_recall = 0
         query_total_time = 0
         ground_truth_results = ground_truth_results_map.get(i, None) if record_recall else None
@@ -1381,6 +1383,11 @@ def run_search_experiment(queries, search_func, queries_num=None, statistics_typ
 
             # Unpack search results based on statistics_type
             results, query_time = search_results
+
+            if record_recall and len(queries_to_process) <= 20:
+                print(f"[QDTree-Debug] Query {i} user {user_id} search results: {results}")
+                if ground_truth_results is not None:
+                    print(f"[QDTree-Debug] Query {i} user {user_id} ground truth: {ground_truth_results}")
 
             if record_recall:
                 # Compute recall
