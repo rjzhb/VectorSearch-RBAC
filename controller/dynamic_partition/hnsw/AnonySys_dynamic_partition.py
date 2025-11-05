@@ -142,7 +142,14 @@ def compute_query_time(comb_trackers, loads, sel_whole, topk, k, beta, a, b, com
         # assume recall is very big, if recall is small, you should implement efs * su/k as described in paper eq.9
         dynamic_value = recall + 1 / 2
 
-    ef_search = math.log(1 / (dynamic_value - k) - 1) / (-4 * beta * sel_whole) * topk + k * topk / sel_whole
+    safe_sel = max(sel_whole, 1e-6)
+    delta = max(dynamic_value - k, 1e-6)
+    inner = 1 / delta - 1
+    if inner <= 0:
+        inner = 1e-6
+    safe_beta = beta if abs(beta) > 1e-6 else 1e-6
+
+    ef_search = math.log(inner) / (-4 * safe_beta * safe_sel) * topk + k * topk / safe_sel
 
     total_query_time = 0
     for comb in comb_to_update:
@@ -729,17 +736,6 @@ if __name__ == '__main__':
                         help="Storage parameter (alpha). Higher values increase storage. Default is 1.5")
     parser.add_argument('--recall', type=float, default=None,
                         help="Recall parameter. Default is None (will use parameters from file)")
-    parser.add_argument(
-        '--enable-heavy-refinement',
-        action='store_true',
-        help='Target a severely imbalanced partition',
-    )
-    parser.add_argument(
-        '--heavy-refinement-factor',
-        type=float,
-        default=2.0,
-        help='Imbalance ratio threshold (largest vs second-largest partition) that triggers heavy refinement.',
-    )
 
     # Parse arguments
     args = parser.parse_args()
@@ -843,69 +839,62 @@ if __name__ == '__main__':
                                                                 comb_role_weights, single_role_weights,
                                                                 combination_mode=False, recall = recall)
 
-    if args.enable_heavy_refinement:
+    logger.info(
+        "Starting targeted greedy refinement (initial partitions: %s)",
+        len(partition_assignment),
+    )
+    sorted_partitions = sorted(
+        ((pid, len(docs)) for pid, docs in partition_assignment.items()),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    largest_partition_id = sorted_partitions[0][0] if sorted_partitions else None
+    largest_size = sorted_partitions[0][1] if sorted_partitions else 0
+    second_size = sorted_partitions[1][1] if len(sorted_partitions) > 1 else 0
+    if largest_partition_id is not None and largest_size > 0:
+        ratio = float('inf') if second_size == 0 else largest_size / max(second_size, 1)
         logger.info(
-            "Starting rebalanced partition (partitions before rebalancing: %s)",
+            "Refining partition %s (size=%s, second=%s, ratio=%.2f)",
+            largest_partition_id,
+            largest_size,
+            second_size,
+            ratio,
+        )
+        partition_assignment, comb_role_trackers = rebalance_heavy_partition(
+            partition_assignment,
+            comb_role_trackers,
+            document_index_to_roles,
+            logger,
+            target_partitions={largest_partition_id},
+        )
+        partition_assignment = clean_empty_partitions(partition_assignment)
+        partition_assignment, partition_mapping = reorganize_partitions(partition_assignment)
+        comb_role_trackers = remap_comb_role_trackers(comb_role_trackers, partition_mapping)
+        logger.info(
+            "Role refinement produced %s partitions after reindexing",
             len(partition_assignment),
         )
-        sorted_partitions = sorted(
-            ((pid, len(docs)) for pid, docs in partition_assignment.items()),
-            key=lambda item: item[1],
-            reverse=True,
+        logger.info("Sample comb_role_trackers mapping (up to 10 entries):")
+        for idx, (comb, mapping) in enumerate(sorted(comb_role_trackers.items(), key=lambda item: item[0])):
+            logger.info("  comb=%s -> partitions=%s", comb, sorted(mapping.keys()))
+            if idx >= 9:
+                break
+        tracked_partitions = sorted({
+            pid for partition_roles in comb_role_trackers.values() for pid in partition_roles.keys()
+        })
+        empty_mappings = [comb for comb, mapping in comb_role_trackers.items() if not mapping]
+        logger.info(
+            "comb_role_trackers covers %s combinations across %s partitions after refinement",
+            len(comb_role_trackers),
+            len(tracked_partitions),
         )
-        largest_partition_id = sorted_partitions[0][0] if sorted_partitions else None
-        largest_size = sorted_partitions[0][1] if sorted_partitions else 0
-        second_size = sorted_partitions[1][1] if len(sorted_partitions) > 1 else 0
-        if largest_partition_id is not None and largest_size > 0:
-            ratio = float('inf') if second_size == 0 else largest_size / max(second_size, 1)
-            logger.info(
-                "Applying targeted refinement to partition %s (size=%s, second=%s, ratio=%.2f, "
-                "factor threshold=%s)",
-                largest_partition_id,
-                largest_size,
-                second_size,
-                ratio,
-                args.heavy_refinement_factor,
+        if empty_mappings:
+            logger.warning(
+                "Combinations with no partitions after refinement (showing up to 5): %s",
+                empty_mappings[:5],
             )
-            if second_size > 0 and largest_size < args.heavy_refinement_factor * second_size:
-                logger.info(
-                    "Largest partition does not exceed imbalance factor (%s); running refinement anyway "
-                    "per user request.",
-                    args.heavy_refinement_factor,
-                )
-            partition_assignment, comb_role_trackers = rebalance_heavy_partition(
-                partition_assignment,
-                comb_role_trackers,
-                document_index_to_roles,
-                logger,
-                target_partitions={largest_partition_id},
-            )
-            partition_assignment = clean_empty_partitions(partition_assignment)
-            partition_assignment, partition_mapping = reorganize_partitions(partition_assignment)
-            comb_role_trackers = remap_comb_role_trackers(comb_role_trackers, partition_mapping)
-            logger.info(
-                "Role refinement produced %s partitions after reindexing",
-                len(partition_assignment),
-            )
-            logger.info("Sample comb_role_trackers mapping (up to 10 entries):")
-            for idx, (comb, mapping) in enumerate(sorted(comb_role_trackers.items(), key=lambda item: item[0])):
-                logger.info("  comb=%s -> partitions=%s", comb, sorted(mapping.keys()))
-                if idx >= 9:
-                    break
-            tracked_partitions = sorted({
-                pid for partition_roles in comb_role_trackers.values() for pid in partition_roles.keys()
-            })
-            empty_mappings = [comb for comb, mapping in comb_role_trackers.items() if not mapping]
-            logger.info(
-                "comb_role_trackers covers %s combinations across %s partitions after refinement",
-                len(comb_role_trackers),
-                len(tracked_partitions),
-            )
-            if empty_mappings:
-                logger.warning(
-                    "Combinations with no partitions after refinement (showing up to 5): %s",
-                    empty_mappings[:5],
-                )
+    else:
+        logger.info("No non-empty partitions found for greedy refinement; skipping.")
 
     delete_faiss_files(project_root)
 
@@ -926,5 +915,5 @@ if __name__ == '__main__':
 
     load_result_to_database(partition_assignment, converted_comb_role_trackers, increment_update=False)
     initialize_dynamic_partition_tables_in_comb(index_type=None)
-    # initialize_dynamic_partition_tables_in_comb(index_type="hnsw")
+    initialize_dynamic_partition_tables_in_comb(index_type="hnsw")
     logger.info("done")

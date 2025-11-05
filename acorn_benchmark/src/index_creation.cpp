@@ -105,13 +105,10 @@ ACORNIndexWithMetadata create_acorn_index(const std::string &conn_info) {
     int d = 300, M = 32, gamma = 12, M_beta = 64;
 
     // Determine the index file path
-    std::string project_root = get_project_root();
-    std::string folder_path = project_root + "/acorn_benchmark/index_file/";
-    std::string index_filename = folder_path + "acorn_index.faiss";
+    std::filesystem::path folder_path = get_index_storage_root();
+    std::filesystem::create_directories(folder_path);
+    std::filesystem::path index_filename = folder_path / "acorn_index.faiss";
 
-    if (!std::filesystem::exists(folder_path)) {
-        std::filesystem::create_directories(folder_path);
-    }
     if (std::filesystem::exists(index_filename)) {
         std::cout << "Index file found. Loading ACORN index from file: " << index_filename << std::endl;
         std::unique_ptr<faiss::IndexACORNFlat> index(
@@ -183,13 +180,10 @@ void try_create_acorn_index(const std::string &conn_info) {
     int d = 300, M = 32, gamma = 12, M_beta = 64;
 
     // Determine the index file path
-    std::string project_root = get_project_root();
-    std::string folder_path = project_root + "/acorn_benchmark/index_file/";
-    std::string index_filename = folder_path + "acorn_index.faiss";
+    std::filesystem::path folder_path = get_index_storage_root();
+    std::filesystem::create_directories(folder_path);
+    std::filesystem::path index_filename = folder_path / "acorn_index.faiss";
 
-    if (!std::filesystem::exists(folder_path)) {
-        std::filesystem::create_directories(folder_path);
-    }
     if (!std::filesystem::exists(index_filename)) {
         std::cout << "Index file not found. Creating ACORN index..." << std::endl;
 
@@ -251,12 +245,9 @@ std::unordered_map<std::string, PartitionIndex> create_dynamic_partition_indices
 
     for (const auto &table_name: partition_tables) {
         // Define the index file path
-        std::string project_root = get_project_root();
-        std::string folder_path = project_root + "/acorn_benchmark/index_file/dynamic_partition/";
-        std::string index_filename = folder_path + table_name + ".faiss";
-        if (!std::filesystem::exists(folder_path)) {
-            std::filesystem::create_directories(folder_path);
-        }
+        std::filesystem::path folder_path = get_index_storage_root() / "dynamic_partition";
+        std::filesystem::path index_filename = folder_path / (table_name + ".faiss");
+        std::filesystem::create_directories(folder_path);
 
         PartitionIndex partition_index;
 
@@ -419,22 +410,46 @@ void try_create_dynamic_partition_indices(
 
     for (const auto &table_name: partition_tables) {
         // Define the index file path
-        std::string project_root = get_project_root();
-        std::string folder_path = project_root + "/acorn_benchmark/index_file/dynamic_partition/";
-        std::string index_filename = folder_path + table_name + ".faiss";
-        if (!std::filesystem::exists(folder_path)) {
-            std::filesystem::create_directories(folder_path);
+        std::filesystem::path folder_path = get_index_storage_root() / "dynamic_partition";
+        std::filesystem::create_directories(folder_path);
+        std::filesystem::path index_filename = folder_path / (table_name + ".faiss");
+
+        // Check whether existing index matches current table size; rebuild if mismatch
+        bool needs_rebuild = true;
+        std::size_t table_count = 0;
+        {
+            pqxx::result count_res = txn.exec("SELECT COUNT(*) FROM " + table_name + ";");
+            table_count = count_res[0][0].as<std::size_t>();
         }
 
-        PartitionIndex partition_index;
-
-        // Check if index file exists
         if (std::filesystem::exists(index_filename)) {
+            try {
+                std::unique_ptr<faiss::Index> existing(faiss::read_index(index_filename.c_str()));
+                if (existing && existing->ntotal == static_cast<long>(table_count)) {
+                    needs_rebuild = false;
+                } else {
+                    std::cout << "Rebuilding index for partition: " << table_name
+                              << " (size mismatch: index has "
+                              << (existing ? existing->ntotal : 0)
+                              << ", table has " << table_count << ")" << std::endl;
+                }
+            } catch (const std::exception &e) {
+                std::cout << "Failed to load existing index for partition " << table_name
+                          << ": " << e.what() << ". Rebuilding." << std::endl;
+            }
+        }
+
+        if (!needs_rebuild) {
             continue;
         }
 
-        // If no existing index, create a new one
-        std::cout << "Creating new index for partition: " << table_name << std::endl;
+        if (table_count == 0) {
+            std::cout << "Skipping partition " << table_name << " because it has no rows." << std::endl;
+            continue;
+        }
+
+        std::cout << (std::filesystem::exists(index_filename) ? "Updating" : "Creating")
+                  << " index for partition: " << table_name << std::endl;
 
         // Fetch document IDs, block IDs, and vectors for this partition
         pqxx::result doc_res = txn.exec(
@@ -443,15 +458,19 @@ void try_create_dynamic_partition_indices(
         std::vector<std::pair<int, int> > document_block_map;
         std::vector<std::vector<float> > partition_vectors;
 
+        document_block_map.reserve(doc_res.size());
+        partition_vectors.reserve(doc_res.size());
         for (const auto &row: doc_res) {
             document_block_map.emplace_back(row[0].as<int>(), row[1].as<int>());
             partition_vectors.push_back(parse_vector(row[2].c_str()));
         }
 
         if (partition_vectors.empty()) {
+            std::filesystem::remove(index_filename);
             throw std::runtime_error("No vectors found in partition: " + table_name);
         }
 
+        PartitionIndex partition_index;
         partition_index.document_block_map = std::move(document_block_map);
 
         // Flatten vectors for FAISS
@@ -500,7 +519,7 @@ void try_create_dynamic_partition_indices(
                                }
         }
 
-        if (skip_rls || build_role_partition_index) {
+        if (skip_rls) {
             std::cout << "Skipping RLS for partition: " << table_name << " (Using HNSW Index)" << std::endl;
 
             // Create HNSW index

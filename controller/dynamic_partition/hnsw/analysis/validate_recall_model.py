@@ -88,8 +88,8 @@ def validate_fitted_model(query_dataset, ef_search_values, fitted_params):
     plt.grid(True)
 
     # Save the validation plot
-    validation_plot_filename = "recall_model_validation.png"
-    plt.savefig(validation_plot_filename, dpi=300)
+    validation_plot_filename = "recall_model_validation.pdf"
+    plt.savefig(validation_plot_filename, dpi=300, bbox_inches="tight")
     plt.show()
 
     print(f"Validation plot saved to: {validation_plot_filename}")

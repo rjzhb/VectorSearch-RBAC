@@ -12,9 +12,6 @@
 
 int main() {
     try {
-        //change this variable to build role partition index once you get dynamic partition solution by very high storage constraint
-        build_role_partition_index = true;
-
         // Get the root directory of the project
         std::string project_root = get_project_root();
 
@@ -37,11 +34,11 @@ int main() {
 
         // Perform ACORN search
         omp_set_num_threads(1);
-        std::vector<int> ef_search_acorn_values = {15,20,25,55,60,65,70}; // Array of ACORN ef_search values
-        std::vector<int> ef_search_partition_values = {10,11,12,13,14,15,16,18,19,20,22,24,26,28,30}; // Array of Dynamic Partition ef_search values
+        std::vector<int> ef_search_acorn_values = {7,8,9,10,11,12,13,15}; // Array of ACORN ef_search values
+        std::vector<int> ef_search_partition_values = {10,15,20,25,30,35,40,45,50}; // Array of Dynamic Partition ef_search values
 
-        bool test_acorn = false;
-        bool test_dynamic_partition = true;
+        bool test_acorn = true;
+        bool test_dynamic_partition =true;
         // Loop over ACORN ef_search values
         if (test_acorn == true) {
             for (int ef_search_acorn: ef_search_acorn_values) {
@@ -51,7 +48,7 @@ int main() {
                         << "s, Recall: " << acorn_recall << std::endl;
 
                 // Calculate space usage for ACORN
-                auto [acorn_space, _] = print_database_and_index_statistics(conn_info, project_root);
+                auto [acorn_space, _] = print_database_and_index_statistics(conn_info);
 
                 // Prepare JSON data
                 nlohmann::json acorn_data = {
@@ -79,7 +76,7 @@ int main() {
                         << "s, Recall: " << partition_recall << std::endl;
 
                 // Calculate space usage for Dynamic Partition
-                auto [_, partition_space] = print_database_and_index_statistics(conn_info, project_root);
+                auto [_, partition_space] = print_database_and_index_statistics(conn_info);
 
                 // Prepare JSON data
                 nlohmann::json partition_data = {

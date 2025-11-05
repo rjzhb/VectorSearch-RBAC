@@ -217,3 +217,13 @@ go to acorn_benchmark directory
 #modify efs value from main.cpp
 build C++ project and run
 ```
+
+Before building, create `acorn_benchmark/config.json` to point benchmarks at the shared index location:
+
+```json
+{
+    "index_storage_path": "/pgsql_data/acorn/"
+}
+```
+
+Make sure `/pgsql_data/acorn/` exists ahead of time; both ACORN and dynamic-partition indexes are persisted there.

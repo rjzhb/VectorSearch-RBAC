@@ -1,4 +1,5 @@
-import random
+import json
+import math
 
 import numpy as np
 import os
@@ -7,6 +8,8 @@ import time
 
 from matplotlib import pyplot as plt
 from scipy.optimize import curve_fit
+
+plt.rcParams.update({"font.size": 22})
 
 project_root = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
@@ -21,6 +24,38 @@ from controller.dynamic_partition.hnsw.analysis.analysis_hnsw_recall import sear
 
 from psycopg2 import sql
 from services.config import get_db_connection
+
+
+def _safe_float(value):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def save_query_time_plot_data(ef_search_values, avg_query_times, avg_total_rows, fitted_query_times, filename):
+    plot_data = []
+
+    for ef_search, actual_time, total_rows, predicted_time in zip(
+        ef_search_values, avg_query_times, avg_total_rows, fitted_query_times
+    ):
+        actual_ms = _safe_float(actual_time / 1_000_000.0) if actual_time else None
+        predicted_ms = _safe_float(predicted_time / 1_000_000.0) if predicted_time else None
+        plot_data.append(
+            {
+                "ef_search": int(ef_search),
+                "avg_query_time": _safe_float(actual_time),
+                "predicted_query_time": _safe_float(predicted_time),
+                "avg_total_rows": _safe_float(total_rows),
+                "avg_query_time_ms": actual_ms,
+                "predicted_query_time_ms": predicted_ms,
+            }
+        )
+
+    with open(filename, "w", encoding="utf-8") as outfile:
+        json.dump(plot_data, outfile, indent=2)
+    logger.info("Saved query time plot data to %s", filename)
 
 
 def search_documents_role_partition_analysis(user_id, query_vector, topk=5, ef_searchs=None):
@@ -48,19 +83,20 @@ def search_documents_role_partition_analysis(user_id, query_vector, topk=5, ef_s
         conn.close()
         return {ef_search: (0, 0) for ef_search in ef_searchs}
 
-    # Randomly select one role_id
-    first_role_id  = random.choice([row[0] for row in role_ids])
-
-    # Query for the role's document blocks
-    table_name = sql.Identifier(f"documentblocks_role_{first_role_id}")
-
-    # Count total rows in the table
-    cur.execute(sql.SQL("SELECT COUNT(*) FROM {};").format(table_name))
-    n_total_rows = cur.fetchone()[0]  # Total rows for the role
+    role_ids = [row[0] for row in role_ids]
+    table_entries = []
+    for role_id in role_ids:
+        table_identifier = sql.Identifier(f"documentblocks_role_{role_id}")
+        cur.execute(sql.SQL("SELECT COUNT(*) FROM {};").format(table_identifier))
+        row_count = cur.fetchone()[0]
+        table_entries.append((table_identifier, row_count))
 
     # Process each ef_search value
     for ef_search in ef_searchs:
         cur.execute(f"SET hnsw.ef_search = {ef_search};")  # Dynamically set ef_search
+
+        aggregate_query_time = 0
+        aggregate_rows = 0
 
         # Execute EXPLAIN ANALYZE to time the query
         explain_query = sql.SQL(
@@ -71,19 +107,26 @@ def search_documents_role_partition_analysis(user_id, query_vector, topk=5, ef_s
             ORDER BY distance
             LIMIT %s
             """
-        ).format(table_name)
+        )
 
-        cur.execute(explain_query, [query_vector, topk])
-        explain_plan = cur.fetchall()
+        for table_identifier, row_count in table_entries:
+            if row_count <= 0:
+                continue
 
-        # Parse query time from EXPLAIN ANALYZE
-        total_query_time = 0
-        for row in explain_plan:
-            if "Execution Time" in row[0]:
-                query_time = float(row[0].split()[-2]) * 1000 * 1000  # Convert to nanoseconds
-                total_query_time += query_time
+            cur.execute(explain_query.format(table_identifier), [query_vector, topk])
+            explain_plan = cur.fetchall()
 
-        results[ef_search] = (total_query_time, n_total_rows)
+            # Parse query time from EXPLAIN ANALYZE
+            table_query_time = 0
+            for row in explain_plan:
+                if "Execution Time" in row[0]:
+                    query_time = float(row[0].split()[-2]) * 1000 * 1000  # Convert to nanoseconds
+                    table_query_time += query_time
+
+            aggregate_query_time += table_query_time
+            aggregate_rows += row_count
+
+        results[ef_search] = (aggregate_query_time, aggregate_rows)
 
     cur.close()
     conn.close()
@@ -154,54 +197,45 @@ def search_documents_brute_force_for_analysis_with_execution_time(user_id, query
     return results
 
 
-def run_experiment_on_ef_search(queries, ef_search_values=[40, 80, 120, 160, 200, 240, 280, 320, 360]):
+def run_experiment_on_ef_search(queries, ef_search_values=None, repetitions=2):
     """
     Run experiments for a given query dataset.
-    Only include the third repetition's time in calculations.
+    Only include the final repetition's time in calculations.
     Calculate the average k value for all queries.
     """
+    if ef_search_values is None:
+        ef_search_values = [20, 40, 60, 80, 100, 120, 140, 160, 180, 200]
+
     logger.info(
-        "Running ef_search experiment: %d queries, values=%s",
+        "Running ef_search experiment query_count=%d, values=%s",
         len(queries),
         ef_search_values,
     )
     start = time.perf_counter()
-    ef_search_results = {}  # Store k values grouped by ef_search
-    from controller.dynamic_partition.hnsw.validate.modelqps_vs_realqps import dynamic_partition_search_analysis
-    actual_query_times = {ef_search: [] for ef_search in ef_search_values}
-    total_rows_by_ef_search = {ef_search: [] for ef_search in ef_search_values}  # Store total rows per ef_search
-    # disable_row_level_security()
-    # drop_database_users()
-    # create_database_users()
-    # enable_row_level_security()
+    ef_search_results = {ef: [] for ef in ef_search_values}  # Store k values grouped by ef_search
+    actual_query_times = {ef: [] for ef in ef_search_values}
+    total_rows_by_ef_search = {ef: [] for ef in ef_search_values}  # Store total rows per ef_search
 
-    for query in queries:
-        user_id = query["user_id"]
-        query_vector = query["query_vector"]
+    for ef_search in ef_search_values:
+        logger.info("Processing ef_search=%d across all queries", ef_search)
+        for query in queries:
+            user_id = query["user_id"]
+            query_vector = query["query_vector"]
 
-        # Execute three repetitions
-        for repetition in range(3):
-            # Perform the search and return results for all ef_search values
-            # query_results = dynamic_partition_search_analysis(
-            #     user_id, query_vector, topk=5, ef_searchs=ef_search_values
-            # )
-            query_results = search_documents_role_partition_analysis(user_id, query_vector, topk=5,
-                                                                     ef_searchs=ef_search_values)
-            # query_results = search_documents_rls_for_analysis_with_execution_time(user_id, query_vector, topk=5,
-            #                                                                       ef_search_values=ef_search_values)
-            # query_results = search_documents_brute_force_for_analysis_with_execution_time(user_id, query_vector, topk=5,
-            #                                                                               ef_search_values=ef_search_values)
-            # Only use the third repetition's results
-            if repetition == 2:
-                for ef_search, (query_time, n_total_rows) in query_results.items():
-                    if n_total_rows > 0:
-                        actual_query_times[ef_search].append(query_time)
-                        total_rows_by_ef_search[ef_search].append(n_total_rows)
-                        k = query_time / np.log(n_total_rows)  # Modified formula
-                        if ef_search not in ef_search_results:
-                            ef_search_results[ef_search] = []
-                        ef_search_results[ef_search].append(k)
-                break
+            for repetition in range(repetitions):
+                query_results = search_documents_role_partition_analysis(
+                    user_id,
+                    query_vector,
+                    topk=5,
+                    ef_searchs=[ef_search],
+                )
+                query_time, n_total_rows = query_results.get(ef_search, (0, 0))
+
+                if repetition == repetitions - 1 and n_total_rows > 0:
+                    actual_query_times[ef_search].append(query_time)
+                    total_rows_by_ef_search[ef_search].append(n_total_rows)
+                    k = query_time / np.log(n_total_rows)
+                    ef_search_results[ef_search].append(k)
 
     # Step 2: Compute the average k value for each ef_search after all queries
     results = []
@@ -255,18 +289,45 @@ def fit_query_time_function_with_log(results):
     fitted_query_times = func(ef_search_values, *params) * logn_values
 
     # Plot the original data and fitted curve
-    plt.figure(figsize=(10, 6))
-    plt.scatter(ef_search_values, avg_query_times, label="Data (Average Query Times)", color="blue")
-    plt.plot(ef_search_values, fitted_query_times, label=f"Fitted Curve: a * x + b\na={params[0]:.2f}, b={params[1]:.2f}",
-             color="red")
-    plt.xlabel("ef_search")
-    plt.ylabel("Query Time")
-    plt.title("Fitting Query Time as a Function of ef_search (Linear Model)")
-    plt.legend()
-    plt.grid(True)
-    plot_filename = f'query_time_analysis.png'
-    plt.savefig(plot_filename)
-    plt.show()
+    avg_query_times_ms = avg_query_times / 1_000_000.0
+    fitted_query_times_ms = fitted_query_times / 1_000_000.0
+
+    plt.figure(figsize=(8, 6), dpi=600)
+    plt.grid(True, linestyle="--", linewidth=0.8, alpha=0.6, zorder=0)
+    plt.plot(
+        ef_search_values,
+        fitted_query_times_ms,
+        color="#d1495b",
+        linewidth=2.5,
+        label=f"Model Fit\n$a={params[0]:.2f}, b={params[1]:.2f}$",
+        zorder=2,
+    )
+    plt.scatter(
+        ef_search_values,
+        avg_query_times_ms,
+        color="#1d3557",
+        marker="o",
+        s=140,
+        edgecolors="white",
+        linewidths=1.2,
+        label="Measured",
+        zorder=3,
+    )
+    plt.xlabel("ef_search", fontsize=28, fontweight="normal")
+    plt.ylabel("Query Time (ms)", fontsize=28, fontweight="normal")
+    plt.xticks(ef_search_values, fontsize=26)
+    plt.yticks(fontsize=26)
+    plt.legend(fontsize=22, loc="upper left")
+    plt.tight_layout()
+    output_dir = os.path.dirname(os.path.abspath(__file__))
+    plot_filename = "query_time_analysis.pdf"
+    plot_path = os.path.join(output_dir, plot_filename)
+    plt.savefig(plot_path, dpi=600, bbox_inches="tight")
+    plt.close()
+
+    data_filename = "query_time_analysis_data.json"
+    data_path = os.path.join(output_dir, data_filename)
+    save_query_time_plot_data(ef_search_values, avg_query_times, avg_total_rows, fitted_query_times, data_path)
 
     logger.info("Fitted parameters: a=%.2f, b=%.2f", params[0], params[1])
     return params
@@ -299,8 +360,8 @@ def fit_ef_search_function_linear(results):
     plt.title("Fitting Average k as a Function of ef_search (Linear Model)")
     plt.legend()
     plt.grid(True)
-    plot_filename = f'qps_analysis.png'
-    plt.savefig(plot_filename)
+    plot_filename = f'qps_analysis.pdf'
+    plt.savefig(plot_filename, bbox_inches="tight")
     plt.show()
 
     logger.info("Fitted parameters: a=%.2f, b=%.2f", params[0], params[1])
@@ -356,7 +417,7 @@ def get_hnsw_qps_parameters():
     with open(query_dataset_path, "r") as infile:
         queries = json.load(infile)
 
-    ef_search_values = [20, 40, 80, 120, 200, 300, 400]
+    ef_search_values = [20, 40, 60, 80, 100, 120, 140, 160, 180, 200]
 
     # Run experiments
     logger.info("Starting QPS ef_search experiment")

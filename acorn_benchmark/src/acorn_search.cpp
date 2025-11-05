@@ -5,6 +5,7 @@
 #include <vector>
 #include <iostream>
 #include <thread>
+#include <filesystem>
 #include <faiss/index_io.h>
 #include <pqxx/pqxx>
 
@@ -108,9 +109,7 @@ std::tuple<double, double> acorn_search_with_reading_index(
     auto ground_truth = compute_groundtruth(queries, conn_info);
 
     // Get the project root and index file path
-    std::string project_root = get_project_root();
-    std::string folder_path = project_root + "/acorn_benchmark/index_file/";
-    std::string index_filename = folder_path + "acorn_index.faiss";
+    std::filesystem::path index_filename = get_index_storage_root() / "acorn_index.faiss";
 
 
     // Load document_block_map outside the loop since it's constant
@@ -146,7 +145,7 @@ std::tuple<double, double> acorn_search_with_reading_index(
             dynamic_cast<faiss::IndexACORNFlat *>(faiss::read_index(index_filename.c_str()))
         );
         if (!acorn_index) {
-            throw std::runtime_error("Failed to load ACORN index from file: " + index_filename);
+            throw std::runtime_error("Failed to load ACORN index from file: " + index_filename.string());
         }
 
         // Extract the specific slice of fields_map for this query

@@ -50,7 +50,5 @@ double get_table_size_in_mb(const std::string &table_name, pqxx::connection &con
 double calculate_table_sizes(const std::vector<std::string> &tables, pqxx::connection &conn);
 
 double calculate_index_file_sizes(const std::string &directory_path);
-
-std::pair<double, double> print_database_and_index_statistics(const std::string &conn_info,
-                                                              const std::string &project_root);
+std::pair<double, double> print_database_and_index_statistics(const std::string &conn_info);
 #endif // BENCHMARK_UTILS_H

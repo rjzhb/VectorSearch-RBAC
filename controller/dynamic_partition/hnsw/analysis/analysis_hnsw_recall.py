@@ -1,20 +1,24 @@
+import json
+import math
+import os
 import re
 import sys
 import time
 
-import numpy as np
-import matplotlib.pyplot as plt
-import json
-
-from psycopg2 import sql
-from scipy.optimize import curve_fit
-import os
-
-from services.logger import get_logger
-
 project_root = os.path.dirname(
     os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))
 sys.path.append(project_root)
+
+import matplotlib.pyplot as plt
+import numpy as np
+
+from psycopg2 import sql
+from scipy.optimize import curve_fit
+
+from services.logger import get_logger
+
+plt.rcParams.update({"font.size": 22})
+
 logger = get_logger(__name__)
 logger.info("project_root set to %s", project_root)
 # Row-level security imports
@@ -26,11 +30,35 @@ from controller.initialize_main_tables import create_indexes, drop_indexes
 from services.config import get_db_connection
 from basic_benchmark.common_function import save_query_plan, ground_truth_func, get_index_type
 from collections import OrderedDict
-import os
 from controller.clear_database import clear_tables
 
 topk = None
 sel = None
+
+
+def _safe_float(value):
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return numeric if math.isfinite(numeric) else None
+
+
+def save_recall_plot_data(ef_search_values, average_recalls, predicted_recalls, filename):
+    plot_data = []
+
+    for ef_search, avg_recall, pred_recall in zip(ef_search_values, average_recalls, predicted_recalls):
+        plot_data.append(
+            {
+                "ef_search": int(ef_search),
+                "average_recall": _safe_float(avg_recall),
+                "predicted_recall": _safe_float(pred_recall),
+            }
+        )
+
+    with open(filename, "w", encoding="utf-8") as outfile:
+        json.dump(plot_data, outfile, indent=2)
+    logger.info("Saved recall plot data to %s", filename)
 
 
 # Step 1: Predicted recall calculation
@@ -403,24 +431,55 @@ def plot_average_recall_with_piecewise_fit(query_dataset, ef_search_values, grou
     piecewise_params = fit_piecewise_model(ef_search_values, average_recalls)
     x_fit = np.linspace(min(ef_search_values), max(ef_search_values), 100)
     piecewise_fit = piecewise_recall_model(x_fit, *piecewise_params)
+    predicted_recalls = piecewise_recall_model(np.array(ef_search_values), *piecewise_params)
 
     # Debugging: Print intermediate values
     logger.info("Fitted Parameters: %s", piecewise_params)
 
     # Plot comparison
-    plt.figure(figsize=(12, 6))
-    plt.scatter(ef_search_values, average_recalls, color='blue', label="Average Recalls")
-    plt.plot(x_fit, piecewise_fit, color="red", label=f"Piecewise Fit: Linear + Sigmoid")
-    plt.axvline(piecewise_params[0] * topk / sel, color="green", linestyle="--",
-                label=f"Split Point (x_c) = {piecewise_params[0] * topk / sel:.4f}")
-    plt.xlabel("Ef_Search")
-    plt.ylabel("Average Recall")
-    plt.title("Average Recall vs Ef_Search with Improved Piecewise Fitting")
-    plt.legend()
-    plt.grid(True)
-    plot_filename = f'recall_analysis.png'
-    plt.savefig(plot_filename)
-    plt.show()
+    plt.figure(figsize=(8, 6), dpi=600)
+    plt.grid(True, linestyle="--", linewidth=0.8, alpha=0.6, zorder=0)
+    plt.plot(
+        x_fit,
+        piecewise_fit,
+        color="#d1495b",
+        linewidth=2.5,
+        label="Model Prediction",
+        zorder=2,
+    )
+    plt.scatter(
+        ef_search_values,
+        average_recalls,
+        color="#1d3557",
+        marker="o",
+        s=140,
+        edgecolors="white",
+        linewidths=1.2,
+        label="Measured",
+        zorder=3,
+    )
+    plt.axvline(
+        piecewise_params[0] * topk / sel,
+        color="#2a9d8f",
+        linestyle="--",
+        linewidth=2,
+        label=f"$x_c={piecewise_params[0] * topk / sel:.2f}$",
+        zorder=1,
+    )
+    plt.xlabel("ef_search", fontsize=28, fontweight="normal")
+    plt.ylabel("Recall", fontsize=28, fontweight="normal")
+    plt.xticks(ef_search_values, fontsize=26, rotation=45)
+    plt.yticks(fontsize=26)
+    plt.ylim(0, 1.05)
+    plt.legend(fontsize=22, loc="lower right")
+    plt.tight_layout()
+    output_dir = os.path.dirname(os.path.abspath(__file__))
+    plot_path = os.path.join(output_dir, "recall_analysis.pdf")
+    plt.savefig(plot_path, dpi=600, bbox_inches="tight")
+    plt.close()
+
+    data_path = os.path.join(output_dir, "recall_analysis_data.json")
+    save_recall_plot_data(ef_search_values, average_recalls, predicted_recalls, data_path)
 
     return piecewise_params
 

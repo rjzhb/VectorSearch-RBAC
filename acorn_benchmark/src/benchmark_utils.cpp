@@ -3,16 +3,107 @@
 #include <pqxx/pqxx>
 #include <chrono>
 #include <iostream>
+#include <fstream>
 #include <sstream>
 #include <set>
 #include <unordered_map>
 #include <limits>
 #include <thread>
+#include <filesystem>
+#include <algorithm>
 #include <faiss/IndexFlat.h> // Include FAISS header for IndexFlatL2
-#include <pqxx/pqxx>
 #include <vector>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <nlohmann/json.hpp>
+
+namespace {
+
+std::filesystem::path ground_truth_cache_path() {
+    return std::filesystem::path(get_project_root()) / "basic_benchmark" / "ground_truth_cache.json";
+}
+
+bool load_groundtruth_from_cache(const std::vector<Query> &queries,
+                                 std::vector<std::pair<int, int>> &ground_truth) {
+    if (queries.empty()) {
+        return false;
+    }
+
+    const auto cache_file = ground_truth_cache_path();
+    std::ifstream in(cache_file);
+    if (!in.good()) {
+        return false;
+    }
+
+    nlohmann::json cache_json;
+    try {
+        in >> cache_json;
+    } catch (...) {
+        return false;
+    }
+
+    if (!cache_json.is_array() || cache_json.size() != queries.size()) {
+        return false;
+    }
+
+    size_t expected_total = 0;
+    for (const auto &query : queries) {
+        expected_total += static_cast<size_t>(std::max(query.topk, 0));
+    }
+
+    std::vector<std::pair<int, int>> cached;
+    cached.reserve(expected_total);
+
+    for (size_t idx = 0; idx < queries.size(); ++idx) {
+        const auto &query = queries[idx];
+        const auto &entry = cache_json[idx];
+        if (!entry.is_array() || entry.size() < query.topk) {
+            return false;
+        }
+        for (int k = 0; k < query.topk; ++k) {
+            const auto &pair = entry[k];
+            if (!pair.is_array() || pair.size() < 2) {
+                return false;
+            }
+            int block_id = pair[0].get<int>();
+            int document_id = pair[1].get<int>();
+            cached.emplace_back(document_id, block_id);
+        }
+    }
+
+    ground_truth = std::move(cached);
+    return true;
+}
+
+void save_groundtruth_to_cache(const std::vector<Query> &queries,
+                               const std::vector<std::pair<int, int>> &ground_truth) {
+    if (queries.empty()) {
+        return;
+    }
+
+    const auto cache_file = ground_truth_cache_path();
+    if (!cache_file.parent_path().empty()) {
+        std::filesystem::create_directories(cache_file.parent_path());
+    }
+
+    nlohmann::json cache_json = nlohmann::json::array();
+    size_t offset = 0;
+    for (const auto &query : queries) {
+        nlohmann::json entry = nlohmann::json::array();
+        for (int k = 0; k < query.topk && offset < ground_truth.size(); ++k, ++offset) {
+            const auto &pair = ground_truth[offset];
+            entry.push_back({pair.second, pair.first});
+        }
+        cache_json.push_back(std::move(entry));
+    }
+
+    std::ofstream out(cache_file);
+    if (out.is_open()) {
+        out << cache_json.dump(2);
+    }
+}
+
+} // namespace
 
 // Helper to parse vector string
 std::vector<float> parse_vector(const std::string &vector_str) {
@@ -78,6 +169,7 @@ double compute_recall(
         // if (query_recall != 1) {
         //     std::cout << query_recall << std::endl;
         // }
+
         total_recall += query_recall;
     }
 
@@ -141,6 +233,15 @@ std::vector<std::pair<int, int> > compute_groundtruth(
     const std::vector<Query> &queries,
     const std::string &conn_info
 ) {
+    if (queries.empty()) {
+        return {};
+    }
+
+    std::vector<std::pair<int, int>> cached_ground_truth;
+    if (load_groundtruth_from_cache(queries, cached_ground_truth)) {
+        return cached_ground_truth;
+    }
+
     pqxx::connection conn(conn_info);
     pqxx::work txn(conn);
 
@@ -190,6 +291,14 @@ std::vector<std::pair<int, int> > compute_groundtruth(
     txn.exec("RESET enable_indexonlyscan;");
 
     txn.commit();
+
+    size_t expected_total = 0;
+    for (const auto &query_obj : queries) {
+        expected_total += static_cast<size_t>(std::max(query_obj.topk, 0));
+    }
+    if (ground_truth_doc_blocks.size() == expected_total) {
+        save_groundtruth_to_cache(queries, ground_truth_doc_blocks);
+    }
 
     return ground_truth_doc_blocks;
 }
@@ -424,7 +533,7 @@ double calculate_index_file_sizes(const std::string &directory_path) {
     return total_size;
 }
 
-std::pair<double, double> print_database_and_index_statistics(const std::string &conn_info, const std::string &project_root) {
+std::pair<double, double> print_database_and_index_statistics(const std::string &conn_info) {
     try {
         pqxx::connection conn(conn_info);
 
@@ -457,12 +566,15 @@ std::pair<double, double> print_database_and_index_statistics(const std::string 
         double dynamic_partition_size_mb = calculate_table_sizes(dynamic_partition_tables, conn);
 
         // Index file paths
-        std::string acorn_index_dir = project_root + "/acorn_benchmark/index_file/";
-        std::string partition_index_dir = project_root + "/acorn_benchmark/index_file/dynamic_partition/";
+        std::filesystem::path index_root = get_index_storage_root();
+        std::filesystem::path acorn_index_dir = index_root;
+        std::filesystem::path partition_index_dir = index_root / "dynamic_partition";
+        std::filesystem::create_directories(acorn_index_dir);
+        std::filesystem::create_directories(partition_index_dir);
 
         // Calculate index sizes
-        double acorn_index_size_mb = calculate_index_file_sizes(acorn_index_dir);
-        double partition_index_size_mb = calculate_index_file_sizes(partition_index_dir);
+        double acorn_index_size_mb = calculate_index_file_sizes(acorn_index_dir.string());
+        double partition_index_size_mb = calculate_index_file_sizes(partition_index_dir.string());
 
         // Return total sizes for ACORN and dynamic partition solutions
         return {

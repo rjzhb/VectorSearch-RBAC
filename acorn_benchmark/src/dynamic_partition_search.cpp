@@ -7,6 +7,8 @@
 #include <unordered_set>
 #include <iostream>
 #include <algorithm>
+#include <limits>
+#include <filesystem>
 #include <faiss/index_io.h>
 #include <pqxx/pqxx>
 #include <faiss/impl/platform_macros.h>
@@ -188,7 +190,8 @@ std::tuple<double, double> benchmark_dynamic_partition_search_with_reading_index
     std::vector<std::pair<int, int> > all_retrieved_results;
 
     // Iterate over each query
-    for (const auto &query: queries) {
+    for (size_t query_idx = 0; query_idx < queries.size(); ++query_idx) {
+        const auto &query = queries[query_idx];
         // Step 1: Retrieve relevant partitions for the current query
         pqxx::connection conn(conn_info);
         pqxx::work txn(conn);
@@ -222,9 +225,8 @@ std::tuple<double, double> benchmark_dynamic_partition_search_with_reading_index
         std::set<std::pair<float, std::pair<int, int>>, ResultComparator> combined_results;
         for (const auto &partition_name: relevant_partitions) {
             // Define the index file path
-            std::string project_root = get_project_root();
-            std::string index_path = project_root + "/acorn_benchmark/index_file/dynamic_partition/" + partition_name +
-                                     ".faiss";
+            std::filesystem::path index_path =
+                get_index_storage_root() / "dynamic_partition" / (partition_name + ".faiss");
 
             // Dynamically load index
             std::unique_ptr<faiss::Index> index(faiss::read_index(index_path.c_str()));
@@ -240,6 +242,20 @@ std::tuple<double, double> benchmark_dynamic_partition_search_with_reading_index
 
             // Retrieve pre-cached document_block_map
             const auto &document_block_map = document_block_maps.at(partition_name);
+
+            const size_t expected_size = document_block_map.size();
+            const size_t actual_size =
+                acorn_index ? static_cast<size_t>(acorn_index->ntotal) : static_cast<size_t>(hnsw_index->ntotal);
+            if (actual_size != expected_size) {
+                std::cerr << "[WARN] Index/doc_map size mismatch for " << partition_name
+                          << ": index has " << actual_size << " entries but table has "
+                          << expected_size << ". Rebuild the index." << std::endl;
+                if (actual_size < expected_size) {
+                    // avoid out-of-bounds
+                    std::cerr << "[WARN] Skipping partition due to mismatch." << std::endl;
+                    continue;
+                }
+            }
 
             // Prepare output containers for this partition
             std::vector<float> distances(query.topk);
@@ -320,7 +336,7 @@ std::tuple<double, double> benchmark_dynamic_partition_search_with_reading_index
 
         // Step 3: Ensure combined_results has top-k elements
         while (combined_results.size() < query.topk) {
-            combined_results.insert({-1.0, {-1, -1}}); // Add placeholder
+            combined_results.insert({std::numeric_limits<float>::infinity(), {-1, -1}}); // Add placeholder
         }
 
         // Sort combined_results by `first` (distance)
@@ -336,7 +352,6 @@ std::tuple<double, double> benchmark_dynamic_partition_search_with_reading_index
             all_retrieved_results.push_back(result.second);
             ++count;
         }
-
     }
 
     // Step 4: Compute recall

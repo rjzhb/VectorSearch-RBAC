@@ -6,8 +6,6 @@
 #include <faiss/IndexACORN.h>
 #include <faiss/IndexHNSW.h>
 
-inline bool build_role_partition_index = false;
-
 // Index container for both ACORN and HNSW
 struct PartitionIndex {
     std::unique_ptr<faiss::IndexHNSWFlat> hnsw_index;

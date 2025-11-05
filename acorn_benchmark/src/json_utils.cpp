@@ -33,6 +33,34 @@ std::string parse_db_config(const std::string& config_path) {
     return conn_info;
 }
 
+std::filesystem::path get_index_storage_root() {
+    static const std::filesystem::path index_root = []() {
+        std::filesystem::path config_path = std::filesystem::path(get_project_root())
+                                            / "acorn_benchmark"
+                                            / "config.json";
+        std::ifstream config_file(config_path);
+        if (!config_file.is_open()) {
+            throw std::runtime_error("Failed to open ACORN config file: " + config_path.string());
+        }
+
+        nlohmann::json config;
+        config_file >> config;
+
+        if (!config.contains("index_storage_path") || !config["index_storage_path"].is_string()) {
+            throw std::runtime_error("`index_storage_path` missing from ACORN config: " + config_path.string());
+        }
+
+        std::filesystem::path base_path(config["index_storage_path"].get<std::string>());
+        if (base_path.empty()) {
+            throw std::runtime_error("`index_storage_path` is empty in ACORN config: " + config_path.string());
+        }
+
+        return base_path;
+    }();
+
+    return index_root;
+}
+
 std::vector<Query> read_queries(const std::string& filepath) {
     std::ifstream file(filepath);
     if (!file.is_open()) {
